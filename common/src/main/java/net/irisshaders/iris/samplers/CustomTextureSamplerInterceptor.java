@@ -12,7 +12,7 @@ import net.irisshaders.iris.shaderpack.properties.PackRenderTargetDirectives;
 import java.util.function.IntSupplier;
 import java.util.function.Supplier;
 
-public final class CustomTextureSamplerInterceptor implements SamplerHolder {
+public class CustomTextureSamplerInterceptor implements SamplerHolder {
 	private final SamplerHolder samplerHolder;
 	private final Object2ObjectMap<String, TextureAccess> customTextureIds;
 	private final ImmutableSet<String> deactivatedOverrides;

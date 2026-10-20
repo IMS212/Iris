@@ -2,7 +2,10 @@ package net.irisshaders.iris.samplers;
 
 import com.mojang.renderpearl.api.buffers.GpuBufferSlice;
 import com.mojang.renderpearl.api.textures.GpuTextureView;
+import it.unimi.dsi.fastutil.objects.Object2LongLinkedOpenHashMap;
+import it.unimi.dsi.fastutil.objects.Object2LongMap;
 import net.irisshaders.iris.backend.IrisImage;
+import net.irisshaders.iris.backend.RenderGraph;
 import net.irisshaders.iris.gl.buffer.ShaderStorageBufferHolder;
 import net.irisshaders.iris.gl.image.ImageHolder;
 import net.irisshaders.iris.gl.sampler.GlSampler;
@@ -24,7 +27,7 @@ import java.util.function.IntSupplier;
 import java.util.function.LongSupplier;
 import java.util.function.Supplier;
 
-public final class ProgramResources implements SamplerHolder, ImageHolder {
+public class ProgramResources implements SamplerHolder, ImageHolder {
 	private final PackSamplers pack;
 	private final List<ShaderResourceLayout.Descriptor> storageDeclarations;
 	private final List<ShaderResourceLayout.Descriptor> uniformDeclarations;
@@ -66,6 +69,10 @@ public final class ProgramResources implements SamplerHolder, ImageHolder {
 		this.uniformBuffers = buffers;
 	}
 
+	public net.irisshaders.iris.gl.buffer.ShaderStorageBuffer getStorageBuffer(int index) {
+		return this.storageBuffers.getBuffer(index);
+	}
+
 	public Map<String, List<GpuBufferSlice>> getBufferBindings() {
 		var result = new LinkedHashMap<String, List<GpuBufferSlice>>();
 
@@ -89,6 +96,48 @@ public final class ProgramResources implements SamplerHolder, ImageHolder {
 		return result;
 	}
 
+	/** Resolve resource identities only while compiling the pack graph, on either backend. */
+	public List<RenderGraph.Access> graphAccesses() {
+		var accesses = new ArrayList<RenderGraph.Access>();
+		for (var entry : this.references.entrySet()) {
+			var descriptor = this.declarations.get(entry.getKey());
+			var binding = this.textures.get(entry.getValue());
+			RenderGraph.Resource resource;
+			if (binding == null) {
+				// Legacy GL samplers and per-draw texel views have no stable parent resource at pack load.
+				resource = new RenderGraph.Resource(!descriptor.type().endsWith("BUFFER"), 0);
+			} else {
+				resource = binding.image() == null ? RenderGraph.image(binding.texture().get().texture())
+					: new RenderGraph.Resource(true, binding.image().get().getImage());
+			}
+			accesses.add(new RenderGraph.Access(resource, RenderGraph.stages(descriptor.stages()), RenderGraph.Usage.SHADER.bit, 0));
+		}
+		var images = this.getImages();
+		for (var descriptor : this.imageDeclarations.values()) {
+			for (var binding : images.get(descriptor.name())) {
+				var resource = binding.image() == null ? RenderGraph.image(binding.texture().texture())
+					: new RenderGraph.Resource(true, binding.image().getImage());
+				accesses.add(new RenderGraph.Access(resource, RenderGraph.stages(descriptor.stages()),
+					descriptor.access().reads() ? RenderGraph.Usage.SHADER.bit : 0,
+					descriptor.access().writes() ? RenderGraph.Usage.SHADER.bit : 0));
+			}
+		}
+		var buffers = this.getBufferBindings();
+		for (var descriptor : this.uniformDeclarations) {
+			for (var slice : buffers.getOrDefault(descriptor.name(), List.of())) {
+				accesses.add(new RenderGraph.Access(RenderGraph.buffer(slice.buffer()), RenderGraph.stages(descriptor.stages()), RenderGraph.Usage.UNIFORM.bit, 0));
+			}
+		}
+		for (var descriptor : this.storageDeclarations) {
+			for (var slice : buffers.get(descriptor.name())) {
+				accesses.add(new RenderGraph.Access(RenderGraph.buffer(slice.buffer()), RenderGraph.stages(descriptor.stages()),
+					descriptor.access().reads() ? RenderGraph.Usage.SHADER.bit : 0,
+					descriptor.access().writes() ? RenderGraph.Usage.SHADER.bit : 0));
+			}
+		}
+		return accesses;
+	}
+
 	public Bindings resolve() {
 		return this.resolve(Map.of());
 	}
@@ -96,7 +145,7 @@ public final class ProgramResources implements SamplerHolder, ImageHolder {
 	public Bindings resolve(Map<String, List<GpuBufferSlice>> supplied) {
 		var resolvedTextures = new LinkedHashMap<PackSamplers.Reference, TextureBinding.Resolved>();
 		this.textures.forEach((reference, binding) -> resolvedTextures.put(reference, binding.resolve(reference.type())));
-		var resolvedTexels = new LinkedHashMap<PackSamplers.Reference, Long>();
+		var resolvedTexels = new Object2LongLinkedOpenHashMap<PackSamplers.Reference>();
 		this.texels.forEach((reference, view) -> resolvedTexels.put(reference, view.getAsLong()));
 		var buffers = this.getBufferBindings();
 		buffers.putAll(supplied);
@@ -190,6 +239,7 @@ public final class ProgramResources implements SamplerHolder, ImageHolder {
 		var referenced = new HashSet<>(this.references.values());
 		this.textures.keySet().retainAll(referenced);
 		this.glTextures.keySet().retainAll(referenced);
+		this.pack.getResources().register(this);
 	}
 
 	public PackSamplers getPackSamplers() {
@@ -343,7 +393,7 @@ public final class ProgramResources implements SamplerHolder, ImageHolder {
 	public record GlTextureBinding(TextureType type, IntSupplier texture, Supplier<GlSampler> sampler, ValueUpdateNotifier notifier) {
 	}
 
-	public record Bindings(Map<PackSamplers.Reference, TextureBinding.Resolved> textures, Map<PackSamplers.Reference, Long> texels, Map<String, List<GpuBufferSlice>> buffers, Map<String, List<ImageBinding>> images) {
+	public record Bindings(Map<PackSamplers.Reference, TextureBinding.Resolved> textures, Object2LongMap<PackSamplers.Reference> texels, Map<String, List<GpuBufferSlice>> buffers, Map<String, List<ImageBinding>> images) {
 	}
 
 	public record ImageBinding(GpuTextureView texture, IrisImage image) {

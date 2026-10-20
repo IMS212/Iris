@@ -11,6 +11,7 @@ import com.mojang.renderpearl.api.vertex.VertexFormat;
 import it.unimi.dsi.fastutil.objects.Object2ObjectMap;
 import it.unimi.dsi.fastutil.objects.Object2ObjectMaps;
 import net.irisshaders.iris.Iris;
+import net.irisshaders.iris.backend.RenderGraph;
 import net.irisshaders.iris.compat.dh.DHCompat;
 import net.irisshaders.iris.features.FeatureFlags;
 import net.irisshaders.iris.gl.GLDebug;
@@ -84,12 +85,12 @@ import net.irisshaders.iris.targets.ClearPass;
 import net.irisshaders.iris.targets.ClearPassCreator;
 import net.irisshaders.iris.targets.CustomImage;
 import net.irisshaders.iris.targets.RenderFramebuffer;
+import net.irisshaders.iris.targets.RenderTargetMipmapState;
 import net.irisshaders.iris.targets.RenderTargets;
 import net.irisshaders.iris.targets.WorldRenderTargets;
 import net.irisshaders.iris.targets.backed.NativeImageBackedSingleColorTexture;
 import net.irisshaders.iris.uniforms.CapturedRenderingState;
 import net.irisshaders.iris.uniforms.CommonUniforms;
-import net.irisshaders.iris.uniforms.FogUniforms;
 import net.irisshaders.iris.uniforms.FrameUpdateNotifier;
 import net.irisshaders.iris.uniforms.VanillaUniforms;
 import net.irisshaders.iris.uniforms.buffer.FrameUniforms;
@@ -145,6 +146,9 @@ public class IrisRenderingPipeline implements WorldRenderingPipeline, ShaderRend
 	private final FrameUpdateNotifier updateNotifier;
 	private final CenterDepthSampler centerDepthSampler;
 	private final ColorSpaceConverter colorSpaceConverter;
+	private final RenderTargetMipmapState mipmapsBeforeShadow;
+	private final RenderTargetMipmapState mipmapsAfterPrepare;
+	private final RenderTargetMipmapState mipmapsAfterTranslucent;
 	private final ImmutableSet<Integer> flippedBeforeShadow;
 	private final ImmutableSet<Integer> flippedAfterPrepare;
 	private final ImmutableSet<Integer> flippedAfterTranslucent;
@@ -303,7 +307,6 @@ public class IrisRenderingPipeline implements WorldRenderingPipeline, ShaderRend
 				CommonUniforms.addNonDynamicUniforms(holder, programSet.getPack().getIdMap(), programSet.getPackDirectives(),
 					this.updateNotifier);
 				BuiltinReplacementUniforms.addBuiltinReplacementUniforms(holder);
-				FogUniforms.addFogColor(holder);
 				VanillaUniforms.addVanillaUniforms(holder);
 			});
 
@@ -320,7 +323,7 @@ public class IrisRenderingPipeline implements WorldRenderingPipeline, ShaderRend
 			cleanup.add(this.biggerWhitePixel::close);
 
 			BufferFlipper flipper = new BufferFlipper();
-			this.centerDepthSampler = new CenterDepthSampler(this.renderTargets::getDepthTexture,
+			this.centerDepthSampler = new CenterDepthSampler(this.packSamplers, this.renderTargets::getDepthTexture,
 				programSet.getPackDirectives().getCenterDepthHalfLife());
 			cleanup.add(this.centerDepthSampler::destroy);
 
@@ -340,9 +343,6 @@ public class IrisRenderingPipeline implements WorldRenderingPipeline, ShaderRend
 				this.shadowTargetsSupplier.get();
 			}
 
-			this.shadowComputes = this.createShadowComputes(programSet.getShadowCompute(), programSet);
-			cleanup.add(() -> destroyComputes(this.shadowComputes));
-
 			this.beginRenderer = new CompositeRenderer(this, CompositePass.BEGIN, programSet.getPackDirectives(),
 				programSet.getComposite(ProgramArrayId.Begin), programSet.getCompute(ProgramArrayId.Begin), this.renderTargets,
 				this.shaderStorageBufferHolder, this.customTextureManager.getNoiseTexture(), this.updateNotifier, this.centerDepthSampler,
@@ -353,6 +353,9 @@ public class IrisRenderingPipeline implements WorldRenderingPipeline, ShaderRend
 			cleanup.add(this.beginRenderer::destroy);
 
 			this.flippedBeforeShadow = flipper.snapshot();
+			this.mipmapsBeforeShadow = this.renderTargets.plannedMipmaps();
+			this.shadowComputes = this.createShadowComputes(programSet.getShadowCompute(), programSet);
+			cleanup.add(() -> destroyComputes(this.shadowComputes));
 
 			this.prepareRenderer = new CompositeRenderer(this, CompositePass.PREPARE, programSet.getPackDirectives(),
 				programSet.getComposite(ProgramArrayId.Prepare), programSet.getCompute(ProgramArrayId.Prepare), this.renderTargets,
@@ -364,6 +367,7 @@ public class IrisRenderingPipeline implements WorldRenderingPipeline, ShaderRend
 			cleanup.add(this.prepareRenderer::destroy);
 
 			this.flippedAfterPrepare = flipper.snapshot();
+			this.mipmapsAfterPrepare = this.renderTargets.plannedMipmaps();
 
 			this.deferredRenderer = new CompositeRenderer(this, CompositePass.DEFERRED, programSet.getPackDirectives(),
 				programSet.getComposite(ProgramArrayId.Deferred), programSet.getCompute(ProgramArrayId.Deferred), this.renderTargets,
@@ -375,6 +379,7 @@ public class IrisRenderingPipeline implements WorldRenderingPipeline, ShaderRend
 			cleanup.add(this.deferredRenderer::destroy);
 
 			this.flippedAfterTranslucent = flipper.snapshot();
+			this.mipmapsAfterTranslucent = this.renderTargets.plannedMipmaps();
 
 			this.compositeRenderer = new CompositeRenderer(this, CompositePass.COMPOSITE, programSet.getPackDirectives(),
 				programSet.getComposite(ProgramArrayId.Composite), programSet.getCompute(ProgramArrayId.Composite), this.renderTargets,
@@ -392,7 +397,7 @@ public class IrisRenderingPipeline implements WorldRenderingPipeline, ShaderRend
 				this.customUniforms);
 			cleanup.add(this.finalPassRenderer::destroy);
 
-			this.dhCompat = new DHCompat(this, shadowDirectives.isDhShadowEnabled().orElse(true));
+			this.dhCompat = new DHCompat(this, shadowDirectives.isDhShadowEnabled().orElse(false));
 			cleanup.add(this.dhCompat::clearPipeline);
 
 			this.loadedShaders = new HashSet<>();
@@ -477,9 +482,36 @@ public class IrisRenderingPipeline implements WorldRenderingPipeline, ShaderRend
 			this.clearPasses = ClearPassCreator.createClearPasses(this.renderTargets, false,
 				programSet.getPackDirectives().getRenderTargetDirectives());
 
+			if (programSet.getPackDirectives().supportsColorCorrection()) {
+				this.colorSpaceConverter = new ColorSpaceConverter() {
+					@Override
+					public void rebuildProgram(int width, int height, ColorSpace colorSpace) {
+					}
+
+					@Override
+					public void process(GpuTextureView target) {
+					}
+				};
+			} else {
+
+				this.colorSpaceConverter = new ColorSpaceFragmentConverter(this.packSamplers, main.width, main.height, IrisVideoSettings.colorSpace);
+			}
+
+			cleanup.add(this.colorSpaceConverter::close);
+			this.currentColorSpace = IrisVideoSettings.colorSpace;
+
+			this.packSamplers.beginFrame();
+
 			for (ComputeProgram program : this.setup) {
 				if (program != null) {
 					program.prepare();
+				}
+			}
+
+			{
+				var graph = new RenderGraph(this.packSamplers);
+				for (var program : this.setup) {
+					if (program != null) graph.compute(program);
 				}
 			}
 
@@ -499,27 +531,6 @@ public class IrisRenderingPipeline implements WorldRenderingPipeline, ShaderRend
 				}
 			}
 
-			if (hasRun) {
-			}
-
-			if (programSet.getPackDirectives().supportsColorCorrection()) {
-				this.colorSpaceConverter = new ColorSpaceConverter() {
-					@Override
-					public void rebuildProgram(int width, int height, ColorSpace colorSpace) {
-					}
-
-					@Override
-					public void process(GpuTextureView target) {
-					}
-				};
-			} else {
-
-				this.colorSpaceConverter = new ColorSpaceFragmentConverter(main.width, main.height, IrisVideoSettings.colorSpace);
-			}
-
-			cleanup.add(this.colorSpaceConverter::close);
-			this.currentColorSpace = IrisVideoSettings.colorSpace;
-
 			{
 				for (ComputeProgram program : this.shadowComputes) {
 					if (program != null) {
@@ -538,9 +549,11 @@ public class IrisRenderingPipeline implements WorldRenderingPipeline, ShaderRend
 				this.finalPassRenderer.prepare();
 				this.colorSpaceConverter.prepare(main.getColorTextureView());
 				this.dhCompat.prepare();
+				this.preparePipelines();
 				Iris.getRenderBackend().finishCompilation();
 			}
-			this.preparePipelines();
+
+			this.buildRenderGraph();
 
 			cleanup.clear();
 		} catch (RuntimeException | Error failure) {
@@ -604,7 +617,7 @@ public class IrisRenderingPipeline implements WorldRenderingPipeline, ShaderRend
 				}
 
 				program.getUniforms().useFrameUniforms(this.frameUniforms);
-				CommonUniforms.addDynamicUniforms(program.getUniforms(), FogMode.OFF);
+				CommonUniforms.addPassUniforms(program.getUniforms());
 
 				Supplier<ImmutableSet<Integer>> flipped;
 
@@ -666,7 +679,7 @@ public class IrisRenderingPipeline implements WorldRenderingPipeline, ShaderRend
 				}
 
 				program.getUniforms().useFrameUniforms(this.frameUniforms);
-				CommonUniforms.addDynamicUniforms(program.getUniforms(), FogMode.OFF);
+				CommonUniforms.addPassUniforms(program.getUniforms());
 
 				ImmutableSet<Integer> empty = ImmutableSet.of();
 				Supplier<ImmutableSet<Integer>> flipped;
@@ -678,7 +691,7 @@ public class IrisRenderingPipeline implements WorldRenderingPipeline, ShaderRend
 				CustomTextureSamplerInterceptor customTextureSamplerInterceptor = new CustomTextureSamplerInterceptor(builder,
 					customTextureManager.getCustomTextureIdMap(textureStage));
 
-				IrisSamplers.addRenderTargetSamplers(customTextureSamplerInterceptor, flipped, renderTargets, true, this);
+				IrisSamplers.addRenderTargetSamplers(customTextureSamplerInterceptor, flipped, renderTargets, true, this, RenderTargetMipmapState.BASE);
 				IrisSamplers.addCustomTextures(builder, customTextureManager.getIrisCustomTextures());
 				IrisSamplers.addCompositeSamplers(builder, renderTargets);
 				IrisSamplers.addCustomImages(customTextureSamplerInterceptor, customImages);
@@ -784,13 +797,17 @@ public class IrisRenderingPipeline implements WorldRenderingPipeline, ShaderRend
 	}
 
 	public void addGbufferOrShadowSamplers(SamplerHolder samplers, ImageHolder images, Supplier<ImmutableSet<Integer>> flipped,
-		boolean isShadowPass, boolean hasTexture, boolean hasLightmap, boolean hasOverlay) {
+		boolean isShadowPass, boolean hasTexture, boolean hasLightmap, boolean hasOverlay, WorldRenderTargets.Phase phase) {
 		TextureStage textureStage = TextureStage.GBUFFERS_AND_SHADOW;
 
 		CustomTextureSamplerInterceptor samplerHolder = new CustomTextureSamplerInterceptor(samplers,
 			customTextureManager.getCustomTextureIdMap().getOrDefault(textureStage, Object2ObjectMaps.emptyMap()));
 
-		IrisSamplers.addRenderTargetSamplers(samplerHolder, flipped, renderTargets, false, this);
+		IrisSamplers.addRenderTargetSamplers(samplerHolder, flipped, renderTargets, false, this, switch (phase) {
+			case SHADOW -> this.mipmapsBeforeShadow;
+			case OPAQUE -> this.mipmapsAfterPrepare;
+			case TRANSLUCENT -> this.mipmapsAfterTranslucent;
+		});
 		IrisSamplers.addCustomTextures(samplerHolder, customTextureManager.getIrisCustomTextures());
 		IrisImages.addRenderTargetImages(images, flipped, renderTargets);
 		IrisImages.addCustomImages(images, customImages);
@@ -920,6 +937,49 @@ public class IrisRenderingPipeline implements WorldRenderingPipeline, ShaderRend
 		}
 	}
 
+	private Runnable afterShadowComputes = () -> { };
+	private Runnable beforeShadowWorld = () -> { };
+	private Runnable afterShadowPack = () -> { };
+	private Runnable beforeOpaqueWorld = () -> { };
+	private Runnable beforeHandDepth = () -> { };
+	private Runnable beforeHandWorld = () -> { };
+	private Runnable beforeTranslucentDepth = () -> { };
+	private Runnable beforeTranslucentWorld = () -> { };
+	private Runnable frameEnd = () -> { };
+
+	private void buildRenderGraph() {
+		var graph = new RenderGraph(this.packSamplers);
+		graph.optional = true;
+		for (var compute : this.shadowComputes) {
+			if (compute != null) graph.compute(compute);
+		}
+		this.afterShadowComputes = graph.external();
+		// Setup runs again only when the targets resize; regular frames must retain their earlier producers.
+		for (var compute : this.setup) {
+			if (compute != null) graph.compute(compute);
+		}
+		graph.optional = false;
+		this.beginRenderer.buildGraph(graph);
+		this.beforeShadowWorld = graph.external();
+		if (this.shadowRenderer != null) {
+			this.shadowRenderTargets.buildMipmaps(graph);
+			if (this.shadowCompositeRenderer != null) this.shadowCompositeRenderer.buildGraph(graph);
+		}
+		// The complete shadow branch can be skipped (for example at zero shadow distance).
+		this.afterShadowPack = graph.external();
+		this.prepareRenderer.buildGraph(graph);
+		this.beforeOpaqueWorld = graph.external();
+		this.centerDepthSampler.buildGraph(graph);
+		this.beforeHandDepth = graph.copy(this.renderTargets.getDepthTexture(), this.renderTargets.getDepthTextureNoHand());
+		this.beforeHandWorld = graph.external();
+		this.beforeTranslucentDepth = graph.copy(this.renderTargets.getDepthTexture(), this.renderTargets.getDepthTextureNoTranslucents());
+		this.deferredRenderer.buildGraph(graph);
+		this.beforeTranslucentWorld = graph.external();
+		this.compositeRenderer.buildGraph(graph);
+		this.finalPassRenderer.buildGraph(graph);
+		this.frameEnd = graph.external();
+	}
+
 	@Override
 	public void beginLevelRendering() {
 		this.preparePipelines();
@@ -981,6 +1041,8 @@ public class IrisRenderingPipeline implements WorldRenderingPipeline, ShaderRend
 			}
 		}
 
+		this.afterShadowComputes.run();
+
 		RenderTarget main = Minecraft.getInstance().gameRenderer.mainRenderTarget();
 
 		GpuTexture depthTexture = main.getDepthTexture();
@@ -1013,6 +1075,8 @@ public class IrisRenderingPipeline implements WorldRenderingPipeline, ShaderRend
 			colorSpaceConverter.rebuildProgram(main.width, main.height, currentColorSpace);
 		}
 
+		if (changed) this.buildRenderGraph();
+
 		final ImmutableList<ClearPass> passes;
 
 		if (renderTargets.isFullClearRequired()) {
@@ -1033,16 +1097,10 @@ public class IrisRenderingPipeline implements WorldRenderingPipeline, ShaderRend
 		isMainBound = true;
 
 		if (changed) {
-			boolean hasRun = false;
-
 			for (ComputeProgram program : setup) {
 				if (program != null) {
-					hasRun = true;
 					program.dispatch(1, 1);
 				}
-			}
-
-			if (hasRun) {
 			}
 		}
 
@@ -1053,11 +1111,14 @@ public class IrisRenderingPipeline implements WorldRenderingPipeline, ShaderRend
 
 	@Override
 	public void renderShadows(LevelRendererAccessor worldRenderer, Camera playerCamera, CameraRenderState renderState) {
+		this.beforeShadowWorld.run();
 		if (shadowRenderer != null) {
 			this.shadowRenderer.renderShadows(worldRenderer, playerCamera, renderState);
 		}
 
+		this.afterShadowPack.run();
 		prepareRenderer.renderAll();
+		this.beforeOpaqueWorld.run();
 	}
 
 	@Override
@@ -1078,7 +1139,9 @@ public class IrisRenderingPipeline implements WorldRenderingPipeline, ShaderRend
 	public void beginHand() {
 		centerDepthSampler.sampleCenterDepth();
 
+		this.beforeHandDepth.run();
 		renderTargets.copyPreHandDepth();
+		this.beforeHandWorld.run();
 	}
 
 	@Override
@@ -1091,10 +1154,11 @@ public class IrisRenderingPipeline implements WorldRenderingPipeline, ShaderRend
 
 		isBeforeTranslucent = false;
 
+		this.beforeTranslucentDepth.run();
 		renderTargets.copyPreTranslucentDepth();
 
 		deferredRenderer.renderAll();
-		DHCompat.renderLods(true);
+		this.beforeTranslucentWorld.run();
 	}
 
 	@Override
@@ -1104,6 +1168,7 @@ public class IrisRenderingPipeline implements WorldRenderingPipeline, ShaderRend
 
 		this.compositeRenderer.renderAll();
 		this.finalPassRenderer.renderFinalPass();
+		this.frameEnd.run();
 	}
 
 	@Override

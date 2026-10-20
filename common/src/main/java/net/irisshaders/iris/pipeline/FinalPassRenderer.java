@@ -2,16 +2,17 @@ package net.irisshaders.iris.pipeline;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
+import it.unimi.dsi.fastutil.ints.Int2ObjectMap;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.Object2ObjectMap;
 import net.irisshaders.iris.Iris;
+import net.irisshaders.iris.backend.RenderGraph;
 import net.irisshaders.iris.features.FeatureFlags;
 import net.irisshaders.iris.gl.buffer.ShaderStorageBufferHolder;
 import net.irisshaders.iris.gl.framebuffer.ViewportData;
 import net.irisshaders.iris.gl.sampler.GlSampler;
 import net.irisshaders.iris.gl.sampler.SamplerHolder;
 import net.irisshaders.iris.gl.shader.ShaderCompileException;
-import net.irisshaders.iris.gl.state.FogMode;
 import net.irisshaders.iris.gl.texture.TextureAccess;
 import net.irisshaders.iris.pathways.CenterDepthSampler;
 import net.irisshaders.iris.pipeline.programs.CompositeProgram;
@@ -42,6 +43,7 @@ import net.irisshaders.iris.uniforms.custom.CustomUniforms;
 import net.minecraft.client.Minecraft;
 import org.jetbrains.annotations.Nullable;
 
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
@@ -76,7 +78,7 @@ public class FinalPassRenderer {
 		this.customImages = customImages;
 
 		final PackRenderTargetDirectives renderTargetDirectives = pack.getPackDirectives().getRenderTargetDirectives();
-		final Map<Integer, PackRenderTargetDirectives.RenderTargetSettings> renderTargetSettings = renderTargetDirectives.getRenderTargetSettings();
+		final Int2ObjectMap<PackRenderTargetDirectives.RenderTargetSettings> renderTargetSettings = renderTargetDirectives.getRenderTargetSettings();
 
 		this.noiseTexture = noiseTexture;
 		this.renderTargets = renderTargets;
@@ -85,8 +87,9 @@ public class FinalPassRenderer {
 			Pass pass = new Pass();
 			ProgramDirectives directives = source.getDirectives();
 
-			pass.program = createProgram(source, flippedBuffers, flippedAtLeastOnce, shadowTargetsSupplier);
 			pass.computes = createComputes(pack.getFinalCompute(), flippedBuffers, flippedAtLeastOnce, shadowTargetsSupplier, holder);
+			renderTargets.planMipmaps(directives.getMipmappedBuffers(), flippedBuffers);
+			pass.program = createProgram(source, flippedBuffers, flippedAtLeastOnce, shadowTargetsSupplier);
 			pass.stageReadsFromAlt = flippedBuffers;
 			pass.mipmappedBuffers = directives.getMipmappedBuffers();
 
@@ -127,14 +130,6 @@ public class FinalPassRenderer {
 		this.swapPasses = swapPasses.build();
 	}
 
-	private static void setupMipmapping(RenderTarget target, boolean readFromAlt) {
-		if (target == null) {
-			return;
-		}
-
-		target.generateMipmaps(readFromAlt);
-	}
-
 	private static void resetRenderTarget(RenderTarget target) {
 		if (target == null) {
 			return;
@@ -158,6 +153,26 @@ public class FinalPassRenderer {
 		program.prepare(List.of(main.getColorTextureView()));
 	}
 
+	public void buildGraph(RenderGraph graph) {
+		this.prepare();
+		if (this.finalPass != null) {
+			for (var compute : this.finalPass.computes) {
+				if (compute != null) graph.compute(compute);
+			}
+			var steps = new ArrayList<Runnable>();
+			for (int index : this.finalPass.mipmappedBuffers) {
+				steps.add(graph.mip(this.renderTargets.get(index), this.finalPass.stageReadsFromAlt.contains(index)));
+			}
+			this.finalPass.mipmapSteps = steps.toArray(Runnable[]::new);
+		}
+		var main = Minecraft.getInstance().gameRenderer.mainRenderTarget();
+		graph.graphics(this.finalPass == null ? this.fallbackProgram : this.finalPass.program, List.of(main.getColorTextureView()));
+		for (var swap : this.swapPasses) {
+			var target = this.renderTargets.get(swap.target);
+			swap.before = graph.copy(target.getTextureView(true, false).texture(), target.getTextureView(false, false).texture());
+		}
+	}
+
 	public void renderFinalPass() {
 		var main = Minecraft.getInstance().gameRenderer.mainRenderTarget();
 		var program = this.finalPass == null ? this.fallbackProgram : this.finalPass.program;
@@ -169,9 +184,7 @@ public class FinalPassRenderer {
 				}
 			}
 
-			for (int index : this.finalPass.mipmappedBuffers) {
-				setupMipmapping(this.renderTargets.get(index), this.finalPass.stageReadsFromAlt.contains(index));
-			}
+			for (var step : this.finalPass.mipmapSteps) step.run();
 		}
 
 		var level = Minecraft.getInstance().level;
@@ -183,6 +196,7 @@ public class FinalPassRenderer {
 		}
 
 		for (SwapPass swap : this.swapPasses) {
+			swap.before.run();
 			var target = this.renderTargets.get(swap.target);
 			Iris.getRenderBackend().commands()
 				.copyTexture(target.getTextureView(true, false).texture(), target.getTextureView(false, false).texture(), target.getWidth(),
@@ -208,7 +222,7 @@ public class FinalPassRenderer {
 		builder.addStorageBuffers(this.pipeline.getStorageBuffers());
 
 		program.getUniforms().useFrameUniforms(this.pipeline.getFrameUniforms());
-		CommonUniforms.addDynamicUniforms(program.getUniforms(), FogMode.OFF);
+		CommonUniforms.addPassUniforms(program.getUniforms());
 
 		CustomTextureSamplerInterceptor customTextureSamplerInterceptor = new CustomTextureSamplerInterceptor(builder,
 			this.customTextureIds, flippedAtLeastOnceSnapshot);
@@ -271,7 +285,7 @@ public class FinalPassRenderer {
 				CustomTextureSamplerInterceptor customTextureSamplerInterceptor = new CustomTextureSamplerInterceptor(builder,
 					this.customTextureIds, flippedAtLeastOnceSnapshot);
 				program.getUniforms().useFrameUniforms(this.pipeline.getFrameUniforms());
-				CommonUniforms.addDynamicUniforms(program.getUniforms(), FogMode.OFF);
+				CommonUniforms.addPassUniforms(program.getUniforms());
 
 				IrisSamplers.addRenderTargetSamplers(customTextureSamplerInterceptor, () -> flipped, renderTargets, true, pipeline);
 				IrisSamplers.addCustomTextures(builder, irisCustomTextures);
@@ -313,10 +327,11 @@ public class FinalPassRenderer {
 		}
 	}
 
-	private static final class Pass {
-		ComputeProgram[] computes;
-		ImmutableSet<Integer> stageReadsFromAlt;
-		ImmutableSet<Integer> mipmappedBuffers;
+	public static class Pass {
+		private Runnable[] mipmapSteps;
+		private ComputeProgram[] computes;
+		private ImmutableSet<Integer> stageReadsFromAlt;
+		private ImmutableSet<Integer> mipmappedBuffers;
 		private CompositeProgram program;
 
 		private void destroy() {
@@ -330,7 +345,8 @@ public class FinalPassRenderer {
 		}
 	}
 
-	private static final class SwapPass {
+	public static class SwapPass {
+		private Runnable before = () -> { };
 		public int target;
 	}
 }

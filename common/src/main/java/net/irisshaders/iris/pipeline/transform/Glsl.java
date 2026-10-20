@@ -1,4 +1,4 @@
-package net.irisshaders.iris.pipeline.transform.vulkan;
+package net.irisshaders.iris.pipeline.transform;
 
 import io.github.douira.glsl_transformer.ast.node.Identifier;
 import io.github.douira.glsl_transformer.ast.node.IterationConditionInitializer;
@@ -23,7 +23,6 @@ import io.github.douira.glsl_transformer.ast.node.type.specifier.ArraySpecifier;
 import io.github.douira.glsl_transformer.ast.node.type.specifier.BuiltinNumericTypeSpecifier;
 import io.github.douira.glsl_transformer.ast.query.Root;
 import io.github.douira.glsl_transformer.util.Type;
-import net.irisshaders.iris.pipeline.transform.Std140Type;
 
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -31,10 +30,7 @@ import java.util.List;
 import java.util.Set;
 import java.util.stream.Stream;
 
-public final class VulkanGlsl {
-	private VulkanGlsl() {
-	}
-
+public class Glsl {
 	public static boolean hasStorage(TypeQualifier qualifier, StorageQualifier.StorageType storage) {
 		return qualifier != null && qualifier.getParts().stream()
 			.anyMatch(p -> p instanceof StorageQualifier s && s.storageType == storage);
@@ -70,8 +66,13 @@ public final class VulkanGlsl {
 
 	public static void setLayout(TypeQualifier qualifier, String name, int value) {
 		removeLayout(qualifier, name);
-		qualifier.getParts().add(0,
-			new LayoutQualifier(Stream.of(new NamedLayoutQualifierPart(new Identifier(name), new LiteralExpression(Type.INT32, value)))));
+		var part = new NamedLayoutQualifierPart(new Identifier(name), new LiteralExpression(Type.INT32, value));
+		var layout = qualifier.getParts().stream().filter(LayoutQualifier.class::isInstance).map(LayoutQualifier.class::cast).findFirst().orElse(null);
+		if (layout == null) {
+			qualifier.getParts().add(0, new LayoutQualifier(Stream.of(part)));
+		} else {
+			layout.getParts().add(part);
+		}
 	}
 
 	public static int integer(Expression expression, Root root) {

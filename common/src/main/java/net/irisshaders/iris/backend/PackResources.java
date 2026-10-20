@@ -1,8 +1,13 @@
 package net.irisshaders.iris.backend;
 
+import net.irisshaders.iris.samplers.ProgramResources;
+
 public interface PackResources extends AutoCloseable {
-	void beginFrame();
+	public void beginFrame();
+
+	public default void register(ProgramResources resources) {
+	}
 
 	@Override
-	void close();
+	public void close();
 }

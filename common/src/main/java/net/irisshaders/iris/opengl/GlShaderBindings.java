@@ -1,17 +1,22 @@
 package net.irisshaders.iris.opengl;
 
-import com.mojang.blaze3d.systems.RenderSystem;
 import com.mojang.renderpearl.api.buffers.GpuBufferSlice;
 import com.mojang.renderpearl.backend.opengl.GlBuffer;
 import com.mojang.renderpearl.backend.opengl.GlSampler;
 import com.mojang.renderpearl.backend.opengl.GlStateManager;
 import com.mojang.renderpearl.backend.opengl.GlTextureView;
+import it.unimi.dsi.fastutil.objects.Object2IntAVLTreeMap;
+import it.unimi.dsi.fastutil.objects.Object2IntMap;
+import it.unimi.dsi.fastutil.objects.Object2IntMaps;
+import it.unimi.dsi.fastutil.objects.Object2IntOpenHashMap;
 import net.irisshaders.iris.gl.IrisRenderSystem;
 import net.irisshaders.iris.gl.state.ValueUpdateNotifier;
+import net.irisshaders.iris.pipeline.transform.PatchShaderType;
 import net.irisshaders.iris.pipeline.transform.PatchedShader;
 import net.irisshaders.iris.pipeline.transform.ShaderResourceLayout;
 import net.irisshaders.iris.samplers.ProgramResources;
-import net.irisshaders.iris.uniforms.buffer.BufferUniformHolder;
+import net.irisshaders.iris.uniforms.buffer.DrawUniforms;
+import net.irisshaders.iris.uniforms.buffer.FrameUniforms;
 import org.lwjgl.opengl.GL11C;
 import org.lwjgl.opengl.GL12C;
 import org.lwjgl.opengl.GL13C;
@@ -23,28 +28,33 @@ import org.lwjgl.opengl.GL32C;
 import org.lwjgl.opengl.GL40C;
 import org.lwjgl.opengl.GL43C;
 
-import java.util.ArrayList;
 import java.util.HashSet;
-import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
-public final class GlShaderBindings implements AutoCloseable {
+public class GlShaderBindings implements AutoCloseable {
 	private static final Set<ValueUpdateNotifier> notifiers = new HashSet<>();
 	private static GlShaderBindings active;
-	final int program;
-	final PatchedShader source;
-	private final Map<String, Integer> bindings;
+	public final int program;
+	public final PatchedShader source;
+	private final Object2IntMap<String> bindings;
 	private final boolean owned;
+	private final String name;
+	private final Object2IntMap<PatchShaderType> shaders = new Object2IntAVLTreeMap<>();
+	private boolean ready;
+	private final GlLooseUniforms looseUniforms;
+	private FrameUniforms frameUniforms;
+	private int frameRevision;
 	private int references = 1;
 
-	GlShaderBindings(String name, PatchedShader input) {
+	public GlShaderBindings(String name, PatchedShader input) {
 		this.owned = true;
+		this.name = name;
 		this.source = input;
 		this.bindings = GlShaderPatcher.getBindings(input.layout());
 		var sources = this.source.sources();
 		this.program = GlStateManager.glCreateProgram();
-		var shaders = new ArrayList<Integer>();
+		this.looseUniforms = new GlLooseUniforms(this.program);
 
 		try {
 			for (var entry : sources.entrySet()) {
@@ -57,46 +67,60 @@ public final class GlShaderBindings implements AutoCloseable {
 					case COMPUTE -> GL43C.GL_COMPUTE_SHADER;
 				};
 				int shader = GlStateManager.glCreateShader(type);
-				shaders.add(shader);
+				this.shaders.put(entry.getKey(), shader);
 				GlStateManager.glShaderSource(shader, entry.getValue());
 				GlStateManager.glCompileShader(shader);
 
-				if (GlStateManager.glGetShaderi(shader, GL20C.GL_COMPILE_STATUS) == 0) {
-					throw new IllegalStateException(
-						"failed to compile " + name + entry.getKey().extension + ": " + IrisRenderSystem.getShaderInfoLog(shader));
-				}
-
 				GlStateManager.glAttachShader(this.program, shader);
-				GlStateManager.glDeleteShader(shader);
-				shaders.removeLast();
 			}
 
 			GlStateManager.glLinkProgram(this.program);
-
-			if (GlStateManager.glGetProgrami(this.program, GL20C.GL_LINK_STATUS) == 0) {
-				throw new IllegalStateException("failed to link " + name + ": " + IrisRenderSystem.getProgramInfoLog(this.program));
-			}
-
-			this.assignBindings();
-		} catch (RuntimeException | Error e) {
-			GlStateManager.glDeleteProgram(this.program);
-			throw e;
-		} finally {
-			for (int shader : shaders) {
-				GlStateManager.glDeleteShader(shader);
-			}
+		} catch (RuntimeException | Error failure) {
+			this.close();
+			throw failure;
 		}
 	}
 
-	public GlShaderBindings(int program, ShaderResourceLayout layout, Map<String, Integer> bindings) {
+	public void finishCompilation() {
+		if (this.ready) {
+			return;
+		}
+
+		try {
+			if (GlStateManager.glGetProgrami(this.program, GL20C.GL_LINK_STATUS) == 0) {
+				for (var entry : this.shaders.object2IntEntrySet()) {
+					if (GlStateManager.glGetShaderi(entry.getIntValue(), GL20C.GL_COMPILE_STATUS) == 0) {
+						throw new IllegalStateException("failed to compile " + this.name + entry.getKey().extension + ": "
+							+ IrisRenderSystem.getShaderInfoLog(entry.getIntValue()));
+					}
+				}
+				throw new IllegalStateException("failed to link " + this.name + ": " + IrisRenderSystem.getProgramInfoLog(this.program));
+			}
+
+			this.assignBindings();
+			this.ready = true;
+		} finally {
+			this.deleteShaders();
+		}
+	}
+
+	private void deleteShaders() {
+		this.shaders.values().forEach(GlStateManager::glDeleteShader);
+		this.shaders.clear();
+	}
+
+	public GlShaderBindings(int program, ShaderResourceLayout layout, Object2IntMap<String> bindings) {
 		this.owned = false;
+		this.name = "external program " + program;
+		this.ready = true;
 		this.program = program;
 		this.source = new PatchedShader(Map.of(), layout, null, null);
-		this.bindings = Map.copyOf(bindings);
+		this.bindings = Object2IntMaps.unmodifiable(new Object2IntOpenHashMap<>(bindings));
+		this.looseUniforms = new GlLooseUniforms(this.program);
 		this.assignBindings();
 	}
 
-	static void bindTexture(int target, int id) {
+	public static void bindTexture(int target, int id) {
 		if (target == GL11C.GL_TEXTURE_2D) {
 			GlStateManager._bindTexture(id);
 		} else {
@@ -110,7 +134,7 @@ public final class GlShaderBindings implements AutoCloseable {
 
 		try {
 			for (var descriptor : this.source.layout().descriptors()) {
-				int binding = this.bindings.get(descriptor.name());
+				int binding = this.bindings.getInt(descriptor.name());
 
 				for (int i = 0; i < descriptor.count(); i++) {
 					String name = descriptor.count() == 1 ? descriptor.name() : descriptor.name() + "[" + i + "]";
@@ -148,7 +172,7 @@ public final class GlShaderBindings implements AutoCloseable {
 		}
 	}
 
-	static void clearDynamicSamplers() {
+	public static void clearDynamicSamplers() {
 		for (var notifier : notifiers) {
 			notifier.setListener(null);
 		}
@@ -167,26 +191,32 @@ public final class GlShaderBindings implements AutoCloseable {
 			if (descriptor.kind() == ShaderResourceLayout.Kind.SAMPLER) {
 				var texture = resources.getGlTextureBinding(resources.getSamplerReferences().get(descriptor.name()));
 				if (texture != null) {
-					bindGlTexture(texture, this.bindings.get(descriptor.name()));
+					bindGlTexture(texture, this.bindings.getInt(descriptor.name()));
 				}
 			}
 		}
 	}
 
-	public void bind(ProgramResources resources, BufferUniformHolder uniforms, ProgramResources.Bindings resolved) {
+	public void bind(ProgramResources resources, DrawUniforms uniforms, ProgramResources.Bindings resolved) {
+		this.finishCompilation();
 		clearDynamicSamplers();
 		active = this;
 		GlStateManager._glUseProgram(this.program);
 		var buffers = resolved.buffers();
 
-		if (uniforms.frameUniforms() != null) {
-			buffers.put(ShaderResourceLayout.FRAME_BLOCK, List.of(uniforms.frameUniforms().snapshot()));
+		var frame = uniforms.frameUniforms();
+		if (frame != null && (this.frameUniforms != frame || this.frameRevision != frame.revision())) {
+			// Program-local values override the same names in the shared frame layout.
+			this.looseUniforms.upload(frame.getLayout().uniforms(), frame.data(), this.source.layout().uniforms().keySet());
+			this.frameUniforms = frame;
+			this.frameRevision = frame.revision();
 		}
+		this.looseUniforms.upload(this.source.layout().uniforms(), uniforms.data());
 
 		var nativePack = (GlRenderBackend.GlPackResources) resources.getPackSamplers().getResources();
 
 		for (var descriptor : this.source.layout().descriptors()) {
-			int binding = this.bindings.get(descriptor.name());
+			int binding = this.bindings.getInt(descriptor.name());
 
 			switch (descriptor.kind()) {
 				case UNIFORM_BUFFER, STORAGE_BUFFER -> {
@@ -222,7 +252,7 @@ public final class GlShaderBindings implements AutoCloseable {
 
 					GlStateManager._activeTexture(GL13C.GL_TEXTURE0 + binding);
 					if (texture == null) {
-						GL11C.glBindTexture(GL31C.GL_TEXTURE_BUFFER, Math.toIntExact(resolved.texels().get(reference)));
+						GL11C.glBindTexture(GL31C.GL_TEXTURE_BUFFER, Math.toIntExact(resolved.texels().getLong(reference)));
 						IrisRenderSystem.bindSamplerToUnit(binding, 0);
 						continue;
 					}
@@ -258,36 +288,31 @@ public final class GlShaderBindings implements AutoCloseable {
 					int image = resource.image() == null ? ((GlTextureView) resource.texture()).glId() : Math.toIntExact(
 						resource.image().getView());
 					int format = resources.getImageFormats().get(descriptor.name()).getGlFormat();
-					IrisRenderSystem.bindImageTexture(binding, image, 0, descriptor.type().contains("3D"), 0, GL15C.GL_READ_WRITE, format);
+					int access = switch (descriptor.access()) {
+						case READ_ONLY -> GL15C.GL_READ_ONLY;
+						case WRITE_ONLY -> GL15C.GL_WRITE_ONLY;
+						case READ_WRITE -> GL15C.GL_READ_WRITE;
+					};
+					IrisRenderSystem.bindImageTexture(binding, image, 0, descriptor.type().contains("3D"), 0, access, format);
 				}
 			}
 		}
 	}
 
-	void bindPushConstants(GpuBufferSlice data) {
-		var binding = this.bindings.get("iris_SodiumPushConstants");
+	public void bindPushConstants(GpuBufferSlice data) {
+		int binding = this.bindings.getInt("iris_SodiumPushConstants");
 
-		if (binding != null) {
+		if (this.bindings.containsKey("iris_SodiumPushConstants")) {
 			GL30C.glBindBufferRange(GL31C.GL_UNIFORM_BUFFER, binding, ((GlBuffer) data.buffer()).handle(), data.offset(), data.length());
 		}
 	}
 
-	Map<String, List<GpuBufferSlice>> uploadUniforms(BufferUniformHolder uniforms) {
-		if (!uniforms.data().hasRemaining()) {
-			return Map.of();
-		}
-
-		var device = RenderSystem.getDevice();
-
-		return Map.of(ShaderResourceLayout.UNIFORM_BLOCK,
-			List.of(uniforms.upload(device.createCommandEncoder(), device.getDeviceInfo().limits().minUniformOffsetAlignment())));
+	public boolean hasStorageWrites(ProgramResources resources) {
+		return resources.getStorageDeclarations().stream().anyMatch(descriptor -> descriptor.access().writes())
+			|| resources.getImageDeclarations().values().stream().anyMatch(descriptor -> descriptor.access().writes());
 	}
 
-	boolean hasStorageWrites(ProgramResources resources) {
-		return !resources.getStorageDeclarations().isEmpty() || !resources.getImageDeclarations().isEmpty();
-	}
-
-	GlShaderBindings retain() {
+	public GlShaderBindings retain() {
 		if (this.references == 0) {
 			throw new IllegalStateException("shader closed");
 		}
@@ -299,10 +324,12 @@ public final class GlShaderBindings implements AutoCloseable {
 	@Override
 	public void close() {
 		if (this.references > 0 && --this.references == 0) {
+			this.frameUniforms = null;
 			if (active == this) {
 				clearDynamicSamplers();
 			}
 			if (this.owned) {
+				this.deleteShaders();
 				GlStateManager.glDeleteProgram(this.program);
 			}
 		}

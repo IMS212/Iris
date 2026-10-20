@@ -6,34 +6,27 @@ import net.irisshaders.iris.backend.ComputePipeline;
 import net.irisshaders.iris.gl.IrisRenderSystem;
 import net.irisshaders.iris.samplers.ProgramResources;
 import net.irisshaders.iris.shaderpack.FilledIndirectPointer;
-import net.irisshaders.iris.uniforms.buffer.BufferUniformHolder;
+import net.irisshaders.iris.uniforms.buffer.DrawUniforms;
 import org.joml.Vector3i;
 import org.lwjgl.opengl.GL20C;
 import org.lwjgl.opengl.GL30C;
-import org.lwjgl.opengl.GL42C;
 import org.lwjgl.opengl.GL43C;
 import org.lwjgl.system.MemoryStack;
 
-final class GlComputePipeline implements ComputePipeline {
+public class GlComputePipeline implements ComputePipeline {
 	private final GlShaderBindings shader;
 	private final ProgramResources resources;
-	private final BufferUniformHolder uniforms;
-	private final Vector3i localSize;
+	private final DrawUniforms uniforms;
+	private Vector3i localSize;
 	private final int[] limits = new int[3];
 	private boolean closed;
 
-	GlComputePipeline(GlShaderBindings shader, ProgramResources resources, BufferUniformHolder uniforms) {
+	public GlComputePipeline(GlShaderBindings shader, ProgramResources resources, DrawUniforms uniforms) {
 		this.shader = shader.retain();
 		this.resources = resources;
 		this.uniforms = uniforms;
 		try {
 			uniforms.resolveLayout(this.shader.source.layout());
-
-			try (var stack = MemoryStack.stackPush()) {
-				var size = stack.mallocInt(3);
-				GL20C.glGetProgramiv(this.shader.program, GL43C.GL_COMPUTE_WORK_GROUP_SIZE, size);
-				this.localSize = new Vector3i(size.get(0), size.get(1), size.get(2));
-			}
 
 			for (int i = 0; i < 3; i++) {
 				this.limits[i] = GL30C.glGetIntegeri(GL43C.GL_MAX_COMPUTE_WORK_GROUP_COUNT, i);
@@ -46,6 +39,14 @@ final class GlComputePipeline implements ComputePipeline {
 
 	@Override
 	public Vector3i localSize() {
+		if (this.localSize == null) {
+			this.shader.finishCompilation();
+			try (var stack = MemoryStack.stackPush()) {
+				var size = stack.mallocInt(3);
+				GL20C.glGetProgramiv(this.shader.program, GL43C.GL_COMPUTE_WORK_GROUP_SIZE, size);
+				this.localSize = new Vector3i(size.get(0), size.get(1), size.get(2));
+			}
+		}
 		return new Vector3i(this.localSize);
 	}
 
@@ -56,9 +57,7 @@ final class GlComputePipeline implements ComputePipeline {
 			}
 		}
 
-		IrisRenderSystem.memoryBarrier(GL42C.GL_ALL_BARRIER_BITS);
 		var resolved = this.resources.resolve();
-		resolved.buffers().putAll(this.shader.uploadUniforms(this.uniforms));
 		try {
 			this.shader.bind(this.resources, this.uniforms, resolved);
 
@@ -68,8 +67,6 @@ final class GlComputePipeline implements ComputePipeline {
 				GlStateManager._glBindBuffer(GL43C.GL_DISPATCH_INDIRECT_BUFFER, ((GlBuffer) indirect.buffer()).handle());
 				IrisRenderSystem.dispatchComputeIndirect(indirect.offset());
 			}
-
-			IrisRenderSystem.memoryBarrier(GL42C.GL_ALL_BARRIER_BITS);
 		} finally {
 			GlShaderBindings.clearDynamicSamplers();
 		}

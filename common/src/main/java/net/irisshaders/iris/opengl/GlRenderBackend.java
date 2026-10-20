@@ -7,20 +7,20 @@ import com.mojang.renderpearl.api.commands.RenderPass.RenderArea;
 import com.mojang.renderpearl.api.commands.RenderPassDescriptor;
 import com.mojang.renderpearl.api.textures.GpuTexture;
 import com.mojang.renderpearl.api.textures.GpuTextureView;
-import com.mojang.renderpearl.backend.api.CommandEncoderBackend;
 import com.mojang.renderpearl.backend.api.RenderPassBackend;
 import com.mojang.renderpearl.backend.opengl.FrameBufferAttachment;
 import com.mojang.renderpearl.backend.opengl.GlBuffer;
 import com.mojang.renderpearl.backend.opengl.GlStateManager;
 import com.mojang.renderpearl.backend.opengl.GlTexture;
-import com.mojang.renderpearl.frontend.FrontendCommandEncoder;
+import it.unimi.dsi.fastutil.objects.Object2IntMap;
+import it.unimi.dsi.fastutil.objects.Object2IntOpenHashMap;
 import net.irisshaders.iris.backend.ComputePipeline;
 import net.irisshaders.iris.backend.GraphicsShader;
 import net.irisshaders.iris.backend.IrisImage;
 import net.irisshaders.iris.backend.NonRenderCommands;
 import net.irisshaders.iris.backend.PackResources;
 import net.irisshaders.iris.backend.RenderBackend;
-import net.irisshaders.iris.backend.SyncCommand;
+import net.irisshaders.iris.backend.RenderGraph;
 import net.irisshaders.iris.backend.WorldPassCommands;
 import net.irisshaders.iris.gl.IrisRenderSystem;
 import net.irisshaders.iris.gl.buffer.ShaderStorageBuffer;
@@ -30,7 +30,7 @@ import net.irisshaders.iris.pipeline.transform.PatchedShader;
 import net.irisshaders.iris.samplers.PackSamplers;
 import net.irisshaders.iris.samplers.ProgramResources;
 import net.irisshaders.iris.shaderpack.FilledIndirectPointer;
-import net.irisshaders.iris.uniforms.buffer.BufferUniformHolder;
+import net.irisshaders.iris.uniforms.buffer.DrawUniforms;
 import org.joml.Vector3i;
 import org.joml.Vector4f;
 import org.lwjgl.opengl.GL11C;
@@ -42,13 +42,12 @@ import org.lwjgl.opengl.GL32C;
 import org.lwjgl.opengl.GL43C;
 import org.lwjgl.system.MemoryUtil;
 
-import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
-public final class GlRenderBackend implements RenderBackend, NonRenderCommands {
+public class GlRenderBackend implements RenderBackend, NonRenderCommands {
 	private final Map<PatchedShader, GlShaderBindings> shaders = new LinkedHashMap<>(16, 0.75f, true);
 	private boolean closed;
 
@@ -79,23 +78,38 @@ public final class GlRenderBackend implements RenderBackend, NonRenderCommands {
 	}
 
 	@Override
-	public WorldPassCommands createRenderPass(CommandEncoderBackend encoder, RenderPassDescriptor descriptor) {
-		return new GlWorldCommands(encoder, descriptor);
+	public WorldPassCommands createRenderPass(RenderPassDescriptor descriptor) {
+		return new GlWorldCommands(descriptor);
 	}
 
 	@Override
 	public WorldPassCommands adaptRenderPass(RenderPassBackend pass, RenderArea area) {
-		return new GlWorldCommands(((FrontendCommandEncoder) RenderSystem.getDevice().createCommandEncoder()).backend(), pass, area, false);
+		return new GlWorldCommands(pass, area, false);
+	}
+
+	@Override
+	public long textureId(GpuTexture texture) {
+		return ((GlTexture) texture).glId();
+	}
+
+	@Override
+	public long bufferId(GpuBuffer buffer) {
+		return ((GlBuffer) buffer).handle();
+	}
+
+	@Override
+	public Runnable barrier(RenderGraph.Dependency dependency) {
+		return GlSynchronization.compile(dependency);
+	}
+
+	@Override
+	public Runnable worldBarrier() {
+		return GlSynchronization.WORLD_IN;
 	}
 
 	@Override
 	public NonRenderCommands commands() {
 		return this;
-	}
-
-	@Override
-	public SyncCommand createSync() {
-		return new GlSyncCommand();
 	}
 
 	@Override
@@ -110,7 +124,7 @@ public final class GlRenderBackend implements RenderBackend, NonRenderCommands {
 
 	@Override
 	public GraphicsShader createGraphicsShader(String name, PatchedShader source, ProgramResources resources,
-		BufferUniformHolder uniforms) {
+		DrawUniforms uniforms) {
 		return new GlGraphicsShader(this.getShader(name, source), resources, uniforms);
 	}
 
@@ -129,11 +143,30 @@ public final class GlRenderBackend implements RenderBackend, NonRenderCommands {
 				var iterator = this.shaders.values().iterator();
 				var oldest = iterator.next();
 				iterator.remove();
-				oldest.close();
+				try {
+					oldest.finishCompilation();
+				} finally {
+					oldest.close();
+				}
 			}
 		}
 
 		return shader;
+	}
+
+	@Override
+	public void finishCompilation() {
+		var iterator = this.shaders.values().iterator();
+		while (iterator.hasNext()) {
+			var shader = iterator.next();
+			try {
+				shader.finishCompilation();
+			} catch (RuntimeException | Error failure) {
+				iterator.remove();
+				shader.close();
+				throw failure;
+			}
+		}
 	}
 
 	@Override
@@ -149,7 +182,7 @@ public final class GlRenderBackend implements RenderBackend, NonRenderCommands {
 
 	@Override
 	public ComputePipeline createComputePipeline(String name, PatchedShader source, ProgramResources resources,
-		BufferUniformHolder uniforms) {
+		DrawUniforms uniforms) {
 		return new GlComputePipeline(this.getShader(name, source), resources, uniforms);
 	}
 
@@ -238,11 +271,11 @@ public final class GlRenderBackend implements RenderBackend, NonRenderCommands {
 		this.generateMipmaps(texture, true);
 	}
 
-	static final class GlPackResources implements PackResources {
-		private final Map<GlSampler.Description, Integer> samplers = new HashMap<>();
+	public static class GlPackResources implements PackResources {
+		private final Object2IntMap<GlSampler.Description> samplers = new Object2IntOpenHashMap<>();
 
-		int getSampler(GlSampler.Description state) {
-			return this.samplers.computeIfAbsent(state, key -> {
+		public int getSampler(GlSampler.Description state) {
+			return this.samplers.computeIntIfAbsent(state, key -> {
 				int id = IrisRenderSystem.genSampler();
 				int mag = key.linear() ? GL11C.GL_LINEAR : GL11C.GL_NEAREST;
 				int min = !key.mipmapped() ? mag : key.linearMips() ? (key.linear() ? GL11C.GL_LINEAR_MIPMAP_LINEAR : GL11C.GL_NEAREST_MIPMAP_LINEAR) : (key.linear() ? GL11C.GL_LINEAR_MIPMAP_NEAREST : GL11C.GL_NEAREST_MIPMAP_NEAREST);

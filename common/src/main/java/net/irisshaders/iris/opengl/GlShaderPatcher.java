@@ -4,19 +4,18 @@ import io.github.douira.glsl_transformer.ast.node.type.qualifier.TypeQualifier;
 import io.github.douira.glsl_transformer.ast.print.ASTPrinter;
 import io.github.douira.glsl_transformer.ast.print.PrintType;
 import io.github.douira.glsl_transformer.ast.transform.SingleASTTransformer;
+import it.unimi.dsi.fastutil.objects.Object2IntAVLTreeMap;
+import it.unimi.dsi.fastutil.objects.Object2IntLinkedOpenHashMap;
+import it.unimi.dsi.fastutil.objects.Object2IntMap;
+import it.unimi.dsi.fastutil.objects.Object2IntMaps;
+import net.irisshaders.iris.pipeline.transform.Glsl;
 import net.irisshaders.iris.pipeline.transform.PatchShaderType;
 import net.irisshaders.iris.pipeline.transform.PatchedShader;
 import net.irisshaders.iris.pipeline.transform.ShaderResourceLayout;
-import net.irisshaders.iris.pipeline.transform.vulkan.VulkanGlsl;
 
 import java.util.EnumMap;
-import java.util.LinkedHashMap;
-import java.util.Map;
 
-public final class GlShaderPatcher {
-	private GlShaderPatcher() {
-	}
-
+public class GlShaderPatcher {
 	public static Result patch(PatchedShader input) {
 		var bindings = getBindings(input.layout());
 
@@ -26,8 +25,8 @@ public final class GlShaderPatcher {
 			var tree = parser.parseSeparateTranslationUnit(text);
 			tree.getRoot().indexBuildSession(() -> {
 				for (var qualifier : tree.getRoot().nodeIndex.getStream(TypeQualifier.class).toList()) {
-					if (VulkanGlsl.layout(qualifier, "set") != null) {
-						VulkanGlsl.removeLayout(qualifier, "set", "binding");
+					if (Glsl.layout(qualifier, "set") != null) {
+						Glsl.removeLayout(qualifier, "set", "binding");
 					}
 				}
 			});
@@ -37,17 +36,17 @@ public final class GlShaderPatcher {
 		return new Result(new PatchedShader(sources, input.layout(), null, input.writtenAttachments()), bindings);
 	}
 
-	public static Map<String, Integer> getBindings(ShaderResourceLayout layout) {
-		var bindings = new LinkedHashMap<String, Integer>();
-		var counts = new EnumMap<ShaderResourceLayout.Kind, Integer>(ShaderResourceLayout.Kind.class);
+	public static Object2IntMap<String> getBindings(ShaderResourceLayout layout) {
+		var bindings = new Object2IntLinkedOpenHashMap<String>();
+		var counts = new Object2IntAVLTreeMap<ShaderResourceLayout.Kind>();
 		for (var descriptor : layout.descriptors()) {
 			int binding = counts.getOrDefault(descriptor.kind(), 0);
 			counts.put(descriptor.kind(), binding + descriptor.count());
 			bindings.put(descriptor.name(), binding);
 		}
-		return Map.copyOf(bindings);
+		return Object2IntMaps.unmodifiable(bindings);
 	}
 
-	public record Result(PatchedShader source, Map<String, Integer> bindings) {
+	public record Result(PatchedShader source, Object2IntMap<String> bindings) {
 	}
 }

@@ -9,13 +9,13 @@ import com.mojang.renderpearl.api.commands.RenderPassDescriptor;
 import com.mojang.renderpearl.api.pipeline.IndexType;
 import com.mojang.renderpearl.api.textures.GpuTextureView;
 import com.mojang.renderpearl.backend.api.BackendRenderPipeline;
-import com.mojang.renderpearl.backend.api.CommandEncoderBackend;
 import com.mojang.renderpearl.backend.api.RenderPassBackend;
 import com.mojang.renderpearl.backend.opengl.GlBuffer;
 import com.mojang.renderpearl.backend.opengl.GlConst;
 import com.mojang.renderpearl.backend.opengl.GlStateManager;
 import net.irisshaders.iris.backend.ForwardingRenderPass;
 import net.irisshaders.iris.backend.GraphicsPipeline;
+import net.irisshaders.iris.backend.RenderBackend;
 import net.irisshaders.iris.backend.WorldPassCommands;
 import net.irisshaders.iris.gl.IrisRenderSystem;
 import org.lwjgl.PointerBuffer;
@@ -38,26 +38,29 @@ import java.nio.IntBuffer;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.OptionalDouble;
 
-public final class GlWorldCommands extends ForwardingRenderPass implements WorldPassCommands {
-	private final CommandEncoderBackend encoder;
+public class GlWorldCommands extends ForwardingRenderPass implements WorldPassCommands {
 	private final boolean owned;
 	private final GpuBufferSlice[] vertices = new GpuBufferSlice[16];
 	private final Map<TexelBufferKey, TexelBufferView> texels = new HashMap<>();
 	private final RenderArea area;
+	private RenderPassDescriptor descriptor;
 	private boolean closed;
 	private GpuBuffer indices;
 	private IndexType indexType = IndexType.INT;
 	private GlGraphicsShader.Pipeline pipeline;
+	private int framebuffer;
 	private boolean storageWrites;
 
-	public GlWorldCommands(CommandEncoderBackend encoder, RenderPassDescriptor descriptor) {
-		this(encoder, encoder.createRenderPass(descriptor), descriptor.renderArea(), true);
+	public GlWorldCommands(RenderPassDescriptor descriptor) {
+		this(RenderBackend.commandEncoder().createRenderPass(descriptor), descriptor.renderArea(), true);
+		this.descriptor = descriptor;
 	}
 
-	public GlWorldCommands(CommandEncoderBackend encoder, RenderPassBackend pass, RenderArea area, boolean owned) {
+	public GlWorldCommands(RenderPassBackend pass, RenderArea area, boolean owned) {
 		super(pass);
-		this.encoder = encoder;
 		this.owned = owned;
 		this.area = area;
 	}
@@ -80,7 +83,7 @@ public final class GlWorldCommands extends ForwardingRenderPass implements World
 	public void close() {
 		if (this.owned && !this.closed) {
 			this.closed = true;
-			this.encoder.submitRenderPass();
+			RenderBackend.commandEncoder().submitRenderPass();
 			this.end();
 		}
 	}
@@ -116,18 +119,26 @@ public final class GlWorldCommands extends ForwardingRenderPass implements World
 	}
 
 	private GpuBufferSlice upload(ByteBuffer data, int alignment) {
-		return this.encoder.transientMemory().uploadGpu(data, alignment, GpuBuffer.USAGE_UNIFORM);
+		return RenderBackend.commandEncoder().transientMemory().uploadGpu(data, alignment, GpuBuffer.USAGE_UNIFORM);
 	}
 
 	@Override
 	public void bindPipeline(GraphicsPipeline pipeline) {
 		this.pipeline = (GlGraphicsShader.Pipeline) pipeline;
-		this.storageWrites = this.pipeline.hasStorageWrites();
+		this.framebuffer = GlStateManager.getFrameBuffer(GL30C.GL_DRAW_FRAMEBUFFER);
+		this.storageWrites = this.pipeline.needsDrawBarrier();
 		this.pipeline.bind();
 	}
 
 	@Override
 	public void setAttachments(List<GpuTextureView> colors, GpuTextureView depth, RenderArea area) {
+		this.restoreDrawBuffers();
+		var builder = RenderPassDescriptor.builder(this.descriptor.label()).withRenderArea(area);
+		colors.forEach(color -> builder.withColorAttachment(color, Optional.empty()));
+		if (depth != null) {
+			builder.withDepthAttachment(depth, OptionalDouble.empty());
+		}
+		this.descriptor = builder.build();
 		int framebuffer = GlRenderBackend.getFramebuffer(colors, depth);
 		GlStateManager._glBindFramebuffer(GL30C.GL_FRAMEBUFFER, framebuffer);
 		int[] buffers = new int[colors.size()];
@@ -160,7 +171,7 @@ public final class GlWorldCommands extends ForwardingRenderPass implements World
 				copy = RenderSystem.getDevice()
 					.createBuffer(() -> "Iris buffer texture slice", GpuBuffer.USAGE_UNIFORM_TEXEL_BUFFER | GpuBuffer.USAGE_COPY_DST,
 						slice.length());
-				this.encoder.copyToBuffer(slice, copy.slice());
+				RenderBackend.commandEncoder().copyToBuffer(slice, copy.slice());
 				GL31C.glTexBuffer(GL31C.GL_TEXTURE_BUFFER, internalFormat, ((GlBuffer) copy).handle());
 			}
 
@@ -170,6 +181,7 @@ public final class GlWorldCommands extends ForwardingRenderPass implements World
 
 	@Override
 	public void end() {
+		this.restoreDrawBuffers();
 		GlShaderBindings.clearDynamicSamplers();
 		if (!this.texels.isEmpty()) {
 			var textures = List.copyOf(this.texels.values());
@@ -181,6 +193,12 @@ public final class GlWorldCommands extends ForwardingRenderPass implements World
 				}
 			}));
 			this.texels.clear();
+		}
+	}
+
+	private void restoreDrawBuffers() {
+		if (this.pipeline != null) {
+			this.pipeline.restoreDrawBuffers(this.framebuffer);
 		}
 	}
 
@@ -300,10 +318,10 @@ public final class GlWorldCommands extends ForwardingRenderPass implements World
 		}
 	}
 
-	private record TexelBufferKey(int buffer, long offset, long length, GpuFormat format) {
+	public record TexelBufferKey(int buffer, long offset, long length, GpuFormat format) {
 	}
 
-	private record TexelBufferView(int texture, GpuBuffer buffer) {
+	public record TexelBufferView(int texture, GpuBuffer buffer) {
 	}
 
 }

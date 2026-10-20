@@ -16,6 +16,8 @@ import io.github.douira.glsl_transformer.token_filter.ChannelFilter;
 import io.github.douira.glsl_transformer.token_filter.TokenChannel;
 import io.github.douira.glsl_transformer.token_filter.TokenFilter;
 import io.github.douira.glsl_transformer.util.LRUCache;
+import it.unimi.dsi.fastutil.ints.Int2IntMap;
+import it.unimi.dsi.fastutil.ints.Int2IntMaps;
 import it.unimi.dsi.fastutil.objects.Object2ObjectMap;
 import net.irisshaders.iris.Iris;
 import net.irisshaders.iris.gl.IrisLimits;
@@ -53,7 +55,7 @@ import net.irisshaders.iris.samplers.ProgramResources;
 import net.irisshaders.iris.samplers.SamplerBindingPlan;
 import net.irisshaders.iris.shaderpack.texture.TextureStage;
 import net.irisshaders.iris.targets.ColorAttachmentPlan;
-import net.irisshaders.iris.uniforms.buffer.BufferUniformHolder;
+import net.irisshaders.iris.uniforms.buffer.DrawUniforms;
 import org.antlr.v4.runtime.Token;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -215,6 +217,9 @@ public class TransformPatcher {
 				});
 			}
 
+			if (parameters.patch == Patch.DH_TERRAIN) {
+				DHTerrainTransformer.transformGrouped(transformer, trees);
+			}
 			GlintTransformer.transformGrouped(transformer, trees, parameters);
 
 			// the compatibility transformer does a grouped transformation
@@ -307,7 +312,7 @@ public class TransformPatcher {
 	}
 
 	public static PatchedShader patchProgram(String name, Map<PatchShaderType, String> sources, ProgramResources resources,
-		BufferUniformHolder uniforms, ColorAttachmentPlan.Program outputs) {
+		DrawUniforms uniforms, ColorAttachmentPlan.Program outputs) {
 		boolean vulkan = GraphicsBackend.isVulkan();
 		var inputs = new EnumMap<PatchShaderType, String>(PatchShaderType.class);
 		sources.forEach((stage, source) -> {
@@ -315,12 +320,15 @@ public class TransformPatcher {
 				inputs.put(stage, source);
 			}
 		});
-		var key = new ProgramCacheKey(Map.copyOf(inputs), vulkan ? resources.getBindingPlan() : null,
+		var samplers = vulkan ? ((net.irisshaders.iris.vulkan.VulkanPackResources) resources.getPackSamplers().getResources())
+			.assign(resources) : null;
+		var buffers = vulkan ? ((net.irisshaders.iris.vulkan.VulkanPackResources) resources.getPackSamplers().getResources())
+			.assignStorageBuffers(resources) : Int2IntMaps.EMPTY_MAP;
+		var key = new ProgramCacheKey(Map.copyOf(inputs), samplers, buffers,
 			outputs == null ? null : outputs.outputLocations(), outputs == null ? 0 : outputs.attachmentCount(),
-			uniforms.registeredUniforms(), uniforms.frameLayout(), uniforms.dynamicUniforms(), vulkan);
+			uniforms.registeredUniforms(), uniforms.plan(), vulkan);
 		var result = programCache.computeIfAbsent(key, unused -> {
-			var patched = VulkanShaderPatcher.patch(key.sources(), key.samplers(), outputs, key.registered()::contains, key.frame(),
-				key.dynamic()::contains, key.vulkan());
+			var patched = VulkanShaderPatcher.patch(key.sources(), key.samplers(), outputs, key.registered()::contains, key.uniforms(), key.vulkan(), key.buffers());
 
 			return key.vulkan() ? patched : GlShaderPatcher.patch(patched).source();
 		});
@@ -397,7 +405,7 @@ public class TransformPatcher {
 			PatchShaderType.COMPUTE, null);
 	}
 
-	private record ProgramCacheKey(Map<PatchShaderType, String> sources, SamplerBindingPlan samplers, List<Integer> outputs, int attachmentCount, Set<String> registered, ShaderResourceLayout frame, Set<String> dynamic, boolean vulkan) {
+	private record ProgramCacheKey(Map<PatchShaderType, String> sources, SamplerBindingPlan samplers, Int2IntMap buffers, List<Integer> outputs, int attachmentCount, Set<String> registered, UniformPlan uniforms, boolean vulkan) {
 	}
 
 	private static class CacheKey {

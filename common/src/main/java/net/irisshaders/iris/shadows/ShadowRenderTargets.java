@@ -7,7 +7,7 @@ import com.mojang.renderpearl.api.textures.GpuTexture;
 import com.mojang.renderpearl.api.textures.GpuTextureView;
 import it.unimi.dsi.fastutil.ints.IntArrayList;
 import it.unimi.dsi.fastutil.ints.IntList;
-import net.irisshaders.iris.Iris;
+import net.irisshaders.iris.backend.RenderGraph;
 import net.irisshaders.iris.features.FeatureFlags;
 import net.irisshaders.iris.gl.sampler.GlSampler;
 import net.irisshaders.iris.gl.texture.InternalTextureFormat;
@@ -377,26 +377,23 @@ public class ShadowRenderTargets {
 		return buffersToBeCleared;
 	}
 
-	public void generateMipmaps() {
-		for (int i = 0; i < 2; i++) {
-			if (this.mipped[i]) {
-				Iris.getRenderBackend().commands().generateDepthMips(i == 0 ? this.mainDepth : this.noTranslucents);
-			}
-		}
+	private Runnable[] mipmapSteps;
 
+	public void buildMipmaps(RenderGraph graph) {
+		var steps = new ArrayList<Runnable>();
+		for (int i = 0; i < 2; i++) {
+			if (this.mipped[i]) steps.add(graph.depthMip(i == 0 ? this.mainDepth : this.noTranslucents));
+		}
 		for (int i = 0; i < this.targets.length; i++) {
 			var target = this.targets[i];
-
-			if (target == null) {
-				continue;
-			}
-
 			var settings = this.shadowDirectives.getColorSamplingSettings().get(i);
-
-			if (settings != null && settings.getMipmap()) {
-				target.generateMipmaps(false);
-			}
+			if (target != null && settings != null && settings.getMipmap()) steps.add(graph.mip(target, false));
 		}
+		this.mipmapSteps = steps.toArray(Runnable[]::new);
+	}
+
+	public void generateMipmaps() {
+		for (var step : this.mipmapSteps) step.run();
 	}
 
 	public GlSampler getSamplerFor(int i) {

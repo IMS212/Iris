@@ -81,12 +81,6 @@ public class DHCompat {
 		}, () -> GlSampler.NEAREST);
 	}
 
-	public static void renderLods(boolean translucent) {
-		if (dhPresent) {
-			LodRendererEvents.renderLods(translucent);
-		}
-	}
-
 	public void prepare() {
 		if (this.compat != null) {
 			this.compat.prepare();

@@ -1,7 +1,6 @@
 package net.irisshaders.iris.pipeline;
 
 import com.google.common.collect.ImmutableList;
-import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import com.mojang.blaze3d.vertex.DefaultVertexFormat;
 import com.mojang.renderpearl.api.pipeline.ColorTargetState;
@@ -9,7 +8,10 @@ import com.mojang.renderpearl.api.pipeline.CompareOp;
 import com.mojang.renderpearl.api.pipeline.DepthStencilState;
 import com.mojang.renderpearl.api.pipeline.PrimitiveTopology;
 import com.mojang.renderpearl.api.pipeline.RenderPipeline;
+import it.unimi.dsi.fastutil.ints.Int2BooleanMap;
+import it.unimi.dsi.fastutil.ints.Int2ObjectMap;
 import it.unimi.dsi.fastutil.objects.Object2ObjectMap;
+import net.irisshaders.iris.backend.RenderGraph;
 import net.irisshaders.iris.features.FeatureFlags;
 import net.irisshaders.iris.gl.blending.BlendModeOverride;
 import net.irisshaders.iris.gl.buffer.ShaderStorageBufferHolder;
@@ -17,7 +19,6 @@ import net.irisshaders.iris.gl.framebuffer.ViewportData;
 import net.irisshaders.iris.gl.sampler.GlSampler;
 import net.irisshaders.iris.gl.sampler.SamplerHolder;
 import net.irisshaders.iris.gl.shader.ShaderCompileException;
-import net.irisshaders.iris.gl.state.FogMode;
 import net.irisshaders.iris.gl.texture.TextureAccess;
 import net.irisshaders.iris.pathways.CenterDepthSampler;
 import net.irisshaders.iris.pipeline.programs.CompositeProgram;
@@ -51,6 +52,7 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.BindGroupLayouts;
 import net.minecraft.resources.Identifier;
 
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.Map;
@@ -85,7 +87,7 @@ public class CompositeRenderer {
 		TextureAccess noiseTexture, FrameUpdateNotifier updateNotifier, CenterDepthSampler centerDepthSampler, BufferFlipper bufferFlipper,
 		Supplier<ShadowRenderTargets> shadowTargetsSupplier, TextureStage textureStage,
 		Object2ObjectMap<String, TextureAccess> customTextureIds, Object2ObjectMap<String, TextureAccess> irisCustomTextures,
-		Set<CustomImage> customImages, ImmutableMap<Integer, Boolean> explicitPreFlips, CustomUniforms customUniforms) {
+		Set<CustomImage> customImages, Int2BooleanMap explicitPreFlips, CustomUniforms customUniforms) {
 		this.pipeline = pipeline;
 		this.compositePass = compositePass;
 		this.noiseTexture = noiseTexture;
@@ -98,7 +100,7 @@ public class CompositeRenderer {
 		this.textureStage = textureStage;
 
 		final PackRenderTargetDirectives renderTargetDirectives = packDirectives.getRenderTargetDirectives();
-		final Map<Integer, PackRenderTargetDirectives.RenderTargetSettings> renderTargetSettings = renderTargetDirectives.getRenderTargetSettings();
+		final Int2ObjectMap<PackRenderTargetDirectives.RenderTargetSettings> renderTargetSettings = renderTargetDirectives.getRenderTargetSettings();
 
 		final ImmutableList.Builder<Pass> passes = ImmutableList.builder();
 		final ImmutableSet.Builder<Integer> flippedAtLeastOnce = new ImmutableSet.Builder<>();
@@ -141,20 +143,21 @@ public class CompositeRenderer {
 
 			pass.attachments = new ColorAttachmentPlan.Builder().program(source.getName(), directives, writesToAlt)
 				.build(renderTargets.maxDrawBuffers());
-			pass.program = this.createProgram(source, flipped, flippedAtLeastOnceSnapshot, shadowTargetsSupplier,
-				pass.attachments.program(source.getName()));
 			pass.blendModeOverride = source.getDirectives().getBlendModeOverride().orElse(null);
 			if (computes.length != 0) {
 				pass.computes = createComputes(computes[i], flipped, flippedAtLeastOnceSnapshot, shadowTargetsSupplier, holder);
 			} else {
 				pass.computes = new ComputeProgram[0];
 			}
+			renderTargets.planMipmaps(directives.getMipmappedBuffers(), flipped);
+			pass.program = this.createProgram(source, flipped, flippedAtLeastOnceSnapshot, shadowTargetsSupplier,
+				pass.attachments.program(source.getName()));
 			int[] drawBuffers = directives.getDrawBuffers();
 
 			int passWidth = 0;
 			int passHeight = 0;
 
-			ImmutableMap<Integer, Boolean> explicitFlips = directives.getExplicitFlips();
+			Int2BooleanMap explicitFlips = directives.getExplicitFlips();
 
 			RenderFramebuffer framebuffer = renderTargets.createMergedFramebuffer(pass.attachments, false);
 
@@ -167,7 +170,7 @@ public class CompositeRenderer {
 				passWidth = target.getWidth();
 				passHeight = target.getHeight();
 
-				if (explicitFlips.get(buffer) == Boolean.FALSE) {
+				if (!explicitFlips.getOrDefault(buffer, true)) {
 					continue;
 				}
 
@@ -196,14 +199,6 @@ public class CompositeRenderer {
 
 		this.passes = passes.build();
 		this.flippedAtLeastOnceFinal = flippedAtLeastOnce.build();
-	}
-
-	private static void setupMipmapping(RenderTarget target, boolean readFromAlt) {
-		if (target == null) {
-			return;
-		}
-
-		target.generateMipmaps(readFromAlt);
 	}
 
 	private boolean hasComputes(ComputeSource[][] computes) {
@@ -262,6 +257,22 @@ public class CompositeRenderer {
 		}
 	}
 
+	public void buildGraph(RenderGraph graph) {
+		this.prepare();
+		for (Pass pass : this.passes) {
+			for (ComputeProgram compute : pass.computes) {
+				if (compute != null) graph.compute(compute);
+			}
+			if (pass instanceof ComputeOnlyPass) continue;
+			var steps = new ArrayList<Runnable>();
+			for (int index : pass.mipmappedBuffers) {
+				steps.add(graph.mip(this.renderTargets.get(index), pass.stageReadsFromAlt.contains(index)));
+			}
+			pass.mipmapSteps = steps.toArray(Runnable[]::new);
+			graph.graphics(pass.program, pass.framebuffer.getColorViews());
+		}
+	}
+
 	public void renderAll() {
 		boolean previousIgnore = ImmediateState.temporarilyIgnorePass;
 		ImmediateState.temporarilyIgnorePass = true;
@@ -278,9 +289,7 @@ public class CompositeRenderer {
 					continue;
 				}
 
-				for (int index : pass.mipmappedBuffers) {
-					setupMipmapping(this.renderTargets.get(index), pass.stageReadsFromAlt.contains(index));
-				}
+				for (var step : pass.mipmapSteps) step.run();
 
 				var level = Minecraft.getInstance().level;
 				pass.program.draw(pass.framebuffer.getColorViews(), pass.viewportScale, level == null ? 0 : level.getGameTime(),
@@ -306,7 +315,7 @@ public class CompositeRenderer {
 		builder.addStorageBuffers(this.pipeline.getStorageBuffers());
 
 		program.getUniforms().useFrameUniforms(this.pipeline.getFrameUniforms());
-		CommonUniforms.addDynamicUniforms(program.getUniforms(), FogMode.OFF);
+		CommonUniforms.addPassUniforms(program.getUniforms());
 
 		CustomTextureSamplerInterceptor customTextureSamplerInterceptor = new CustomTextureSamplerInterceptor(builder,
 			this.customTextureIds, flippedAtLeastOnceSnapshot);
@@ -369,7 +378,7 @@ public class CompositeRenderer {
 				CustomTextureSamplerInterceptor customTextureSamplerInterceptor = new CustomTextureSamplerInterceptor(builder,
 					this.customTextureIds, flippedAtLeastOnceSnapshot);
 				program.getUniforms().useFrameUniforms(this.pipeline.getFrameUniforms());
-				CommonUniforms.addDynamicUniforms(program.getUniforms(), FogMode.OFF);
+				CommonUniforms.addPassUniforms(program.getUniforms());
 
 				IrisSamplers.addRenderTargetSamplers(customTextureSamplerInterceptor, () -> flipped, renderTargets, true, pipeline);
 				IrisSamplers.addCustomTextures(builder, irisCustomTextures);
@@ -408,17 +417,18 @@ public class CompositeRenderer {
 		}
 	}
 
-	private static class Pass {
-		int[] drawBuffers;
-		int viewWidth;
-		int viewHeight;
-		String name;
-		BlendModeOverride blendModeOverride;
-		ComputeProgram[] computes;
-		ImmutableSet<Integer> flippedAtLeastOnce;
-		ImmutableSet<Integer> stageReadsFromAlt;
-		ImmutableSet<Integer> mipmappedBuffers;
-		ViewportData viewportScale;
+	public static class Pass {
+		protected Runnable[] mipmapSteps;
+		protected int[] drawBuffers;
+		protected int viewWidth;
+		protected int viewHeight;
+		protected String name;
+		protected BlendModeOverride blendModeOverride;
+		protected ComputeProgram[] computes;
+		protected ImmutableSet<Integer> flippedAtLeastOnce;
+		protected ImmutableSet<Integer> stageReadsFromAlt;
+		protected ImmutableSet<Integer> mipmappedBuffers;
+		protected ViewportData viewportScale;
 		private CompositeProgram program;
 		private ColorAttachmentPlan attachments;
 		private RenderFramebuffer framebuffer;
@@ -433,7 +443,7 @@ public class CompositeRenderer {
 		}
 	}
 
-	private static class ComputeOnlyPass extends Pass {
+	public static class ComputeOnlyPass extends Pass {
 		@Override
 		protected void destroy() {
 			for (ComputeProgram compute : this.computes) {

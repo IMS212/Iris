@@ -178,6 +178,16 @@ public class ShadowRenderer {
 			Minecraft.getInstance().gameRenderer.gameRenderState());
 	}
 
+	public static Matrix4f createShadowProjection(float halfPlaneLength, float nearPlane, float farPlane, Float fov) {
+		if (fov != null) {
+			// Legacy packs can request a perspective shadow projection.
+			return ShadowMatrices.createPerspectiveMatrix(fov);
+		}
+		return ShadowMatrices.createOrthoMatrix(halfPlaneLength,
+			Mth.equal(nearPlane, -1.0f) ? -DHCompat.getRenderDistance() * 16 : nearPlane,
+			Mth.equal(farPlane, -1.0f) ? DHCompat.getRenderDistance() * 16 : farPlane);
+	}
+
 	public static PoseStack createShadowModelView(float sunPathRotation, float intervalSize, float nearPlane, float farPlane) {
 		// Determine the camera position
 		Vector3d cameraPos = CameraUniforms.getUnshiftedCameraPosition();
@@ -312,7 +322,18 @@ public class ShadowRenderer {
 		return holder;
 	}
 
+	// i do not feel like wrapping everything right now...
 	public void renderShadows(LevelRendererAccessor levelRenderer, Camera playerCamera, CameraRenderState renderState) {
+		boolean wasRenderingShadows = ACTIVE;
+		try {
+			this.renderShadowPass(levelRenderer, playerCamera, renderState, wasRenderingShadows);
+		} finally {
+			ACTIVE = wasRenderingShadows;
+		}
+	}
+
+	private void renderShadowPass(LevelRendererAccessor levelRenderer, Camera playerCamera, CameraRenderState renderState,
+		boolean wasRenderingShadows) {
 		if (IrisVideoSettings.getOverriddenShadowDistance(IrisVideoSettings.shadowDistance) == 0) {
 			return;
 		}
@@ -354,16 +375,7 @@ public class ShadowRenderer {
 		RenderSystem.getModelViewStack().pushMatrix();
 		RenderSystem.getModelViewStack().set(MODELVIEW);
 
-		// Set up our orthographic projection matrix and load it into RenderSystem
-		Matrix4f shadowProjection;
-		if (this.fov != null) {
-			// If FOV is not null, the pack wants a perspective based projection matrix. (This is to support legacy packs)
-			shadowProjection = ShadowMatrices.createPerspectiveMatrix(this.fov);
-		} else {
-			shadowProjection = ShadowMatrices.createOrthoMatrix(halfPlaneLength,
-				Mth.equal(nearPlane, -1.0f) ? -DHCompat.getRenderDistance() * 16 : nearPlane,
-				Mth.equal(farPlane, -1.0f) ? DHCompat.getRenderDistance() * 16 : farPlane);
-		}
+		Matrix4f shadowProjection = createShadowProjection(this.halfPlaneLength, this.nearPlane, this.farPlane, this.fov);
 		levelRenderState.cameraRenderState.projectionMatrix = shadowProjection;
 
 		IrisRenderSystem.setShadowProjection(shadowProjection);
@@ -542,9 +554,6 @@ public class ShadowRenderer {
 			frame.close();
 			buffers.endFrame();
 
-			if (this.shouldRenderDH) {
-				DHCompat.renderLods(false);
-			}
 			copyPreTranslucentDepth(levelRenderer);
 
 			RenderSystem.getModelViewStack().set(MODELVIEW);
@@ -562,9 +571,6 @@ public class ShadowRenderer {
 						Optional.empty(), Minecraft.getInstance().gameRenderer.mainRenderTarget().getDepthTextureView(),
 						OptionalDouble.empty())) {
 					sections.renderGroup(ChunkSectionLayerGroup.TRANSLUCENT, renderPass, theSampler, atlas, false);
-				}
-				if (this.shouldRenderDH) {
-					DHCompat.renderLods(true);
 				}
 				pipeline.setPhase(WorldRenderingPhase.NONE);
 			}
@@ -602,7 +608,7 @@ public class ShadowRenderer {
 		levelRenderer.setRenderBuffers(playerBuffers);
 
 		visibleBlockEntities = null;
-		ACTIVE = false;
+		ACTIVE = wasRenderingShadows;
 
 		levelRenderState.cameraRenderState.viewRotationMatrix = cameraViewRotation;
 		levelRenderState.cameraRenderState.projectionMatrix = cameraProjection;

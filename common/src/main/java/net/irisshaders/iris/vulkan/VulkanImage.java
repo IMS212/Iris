@@ -22,6 +22,8 @@ import org.lwjgl.vulkan.VkImageViewCreateInfo;
 
 import java.nio.ByteBuffer;
 
+import static net.irisshaders.iris.vulkan.VulkanChecks.check;
+
 public class VulkanImage implements IrisImage {
 	private final VulkanDevice device;
 	private final TextureType type;
@@ -78,8 +80,7 @@ public class VulkanImage implements IrisImage {
 			device.instance().debug().setObjectName(device.vkDevice(), VK10.VK_OBJECT_TYPE_IMAGE, this.image, name);
 			device.instance().debug().setObjectName(device.vkDevice(), VK10.VK_OBJECT_TYPE_IMAGE_VIEW, this.view, name);
 
-			var encoder = device.createCommandEncoder();
-			var command = VulkanCommandBridge.commandBuffer(encoder);
+			var command = VulkanCommandBridge.commandBuffer();
 			var barrier = VkImageMemoryBarrier.calloc(1, stack).sType$Default().oldLayout(VK10.VK_IMAGE_LAYOUT_UNDEFINED)
 				.newLayout(VK10.VK_IMAGE_LAYOUT_GENERAL).dstAccessMask(VK10.VK_ACCESS_MEMORY_READ_BIT | VK10.VK_ACCESS_MEMORY_WRITE_BIT)
 				.srcQueueFamilyIndex(VK10.VK_QUEUE_FAMILY_IGNORED).dstQueueFamilyIndex(VK10.VK_QUEUE_FAMILY_IGNORED).image(this.image);
@@ -97,12 +98,6 @@ public class VulkanImage implements IrisImage {
 		}
 	}
 
-	private static void check(int status, String action) {
-		if (status != VK10.VK_SUCCESS) {
-			throw new IllegalStateException("failed to " + action + ": " + status);
-		}
-	}
-
 	@Override
 	public TextureType getType() {
 		return this.type;
@@ -110,17 +105,11 @@ public class VulkanImage implements IrisImage {
 
 	@Override
 	public long getView() {
-		if (this.view == 0) {
-			throw new IllegalStateException("image is closed");
-		}
-
 		return this.view;
 	}
 
 	@Override
 	public long getImage() {
-		this.getView();
-
 		return this.image;
 	}
 
@@ -141,12 +130,10 @@ public class VulkanImage implements IrisImage {
 
 	@Override
 	public void upload(ByteBuffer data) {
-		this.getView();
-
-		try (var stack = MemoryStack.stackPush(); var staging = this.device.createBuffer(() -> "Iris image upload",
-			GpuBuffer.USAGE_COPY_SRC, data)) {
-			var encoder = this.device.createCommandEncoder();
-			var command = VulkanCommandBridge.commandBuffer(encoder);
+		try (var stack = MemoryStack.stackPush()) {
+			var staging = this.device.createBuffer(() -> "Iris image upload",
+				GpuBuffer.USAGE_COPY_SRC, data);
+			var command = VulkanCommandBridge.commandBuffer();
 			VulkanCommandEncoder.memoryBarrier(command, stack);
 
 			var region = VkBufferImageCopy.calloc(1, stack);
@@ -154,15 +141,13 @@ public class VulkanImage implements IrisImage {
 			region.imageExtent().set(this.width, this.height, this.depth);
 			VK10.vkCmdCopyBufferToImage(command, ((VulkanGpuBuffer) staging).vkBuffer(), this.image, VK10.VK_IMAGE_LAYOUT_GENERAL, region);
 			VulkanCommandEncoder.memoryBarrier(command, stack);
+			staging.close();
 		}
 	}
 
 	@Override
 	public void clear() {
-		this.getView();
-
-		var encoder = this.device.createCommandEncoder();
-		var command = VulkanCommandBridge.commandBuffer(encoder);
+		var command = VulkanCommandBridge.commandBuffer();
 
 		try (var stack = MemoryStack.stackPush()) {
 			VulkanCommandEncoder.memoryBarrier(command, stack);

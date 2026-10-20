@@ -9,7 +9,7 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Set;
 
-public final class PackSamplers implements AutoCloseable {
+public class PackSamplers implements AutoCloseable {
 	private final PackResources resources;
 	private final Map<Key, Reference> references = new LinkedHashMap<>();
 	private final Set<Reference> drawReferences = new HashSet<>();

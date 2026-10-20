@@ -10,17 +10,17 @@ import net.irisshaders.iris.samplers.PackSamplers;
 import net.irisshaders.iris.samplers.ProgramResources;
 import net.irisshaders.iris.shaderpack.FilledIndirectPointer;
 import net.irisshaders.iris.uniforms.SystemTimeUniforms;
-import net.irisshaders.iris.uniforms.buffer.BufferUniformHolder;
+import net.irisshaders.iris.uniforms.buffer.DrawUniforms;
 import net.minecraft.client.Minecraft;
 import org.joml.Vector2f;
 import org.joml.Vector3i;
 
 import java.util.Map;
 
-public final class ComputeProgram implements AutoCloseable {
+public class ComputeProgram implements AutoCloseable {
 	private final String name;
 	private final String source;
-	private final BufferUniformHolder uniforms;
+	private final DrawUniforms uniforms;
 	private final ProgramResources samplers;
 	private FilledIndirectPointer indirect;
 	private Vector3i absoluteWorkGroups;
@@ -44,8 +44,8 @@ public final class ComputeProgram implements AutoCloseable {
 			}
 		}
 
-		this.uniforms = new BufferUniformHolder(resources);
 		this.samplers = new ProgramResources(pack, resources);
+		this.uniforms = new DrawUniforms(resources);
 	}
 
 	public void setWorkGroupInfo(Vector2f relativeWorkGroups, Vector3i absoluteWorkGroups, FilledIndirectPointer indirectPointer) {
@@ -85,7 +85,7 @@ public final class ComputeProgram implements AutoCloseable {
 		this.close();
 	}
 
-	public BufferUniformHolder getUniforms() {
+	public DrawUniforms getUniforms() {
 		return this.uniforms;
 	}
 
@@ -111,9 +111,16 @@ public final class ComputeProgram implements AutoCloseable {
 		}
 	}
 
+	public Runnable before = () -> { };
+
+	public FilledIndirectPointer indirect() {
+		return this.indirect;
+	}
+
 	public void dispatch(Vector3i groups, long tick, long frame) {
 		this.prepare();
-		this.uniforms.update(tick, frame);
+		this.uniforms.evaluateLocalValues(tick, frame);
+		this.before.run();
 		Iris.getRenderBackend().commands().dispatch(this.pipeline, groups, this.indirect);
 	}
 
@@ -124,6 +131,7 @@ public final class ComputeProgram implements AutoCloseable {
 		}
 
 		this.closed = true;
+		this.uniforms.close();
 
 		if (this.pipeline != null) {
 			Iris.getRenderBackend().retire(this.pipeline::close);

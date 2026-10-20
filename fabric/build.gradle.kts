@@ -149,9 +149,15 @@ loom {
             configName = "Fabric Client"
             ideConfigGenerated(true)
             runDir("run")
+            if (providers.gradleProperty("irisLinuxRenderDoc").map { it.toBoolean() }.getOrElse(false)) {
+                environmentVariable("LD_PRELOAD", "/usr/lib/librenderdoc.so")
+                environmentVariable("SDL_VIDEODRIVER", "x11")
+            }
+            vmArgs("-XX:+UseZGC",
+                "-XX:+UseStringDeduplication",
+                    "-XX:+UseCompactObjectHeaders")
             // vmArgs("-Dmixin.debug.export=true")
             // vmArg("-XX:+AllowEnhancedClassRedefinition")
-            //environmentVariable("SDL_VIDEODRIVER", "x11")
         }
     }
 }

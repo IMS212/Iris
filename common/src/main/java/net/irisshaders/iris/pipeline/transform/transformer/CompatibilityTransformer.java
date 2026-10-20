@@ -370,7 +370,12 @@ public class CompatibilityTransformer {
 		}
 
 		for (var tree : trees.values()) {
-			tree.getRoot().rename("sampler", samplerName);
+			for (var identifier : tree.getRoot().identifierIndex.getStream("sampler").toList()) {
+				var declaration = identifier.getAncestor(TypeAndInitDeclaration.class);
+				if (identifier.getParent() instanceof io.github.douira.glsl_transformer.ast.node.type.specifier.TypeReference
+					&& declaration != null && declaration.getMembers().stream().anyMatch(member -> member.getName().getName().equals("iris_heapSamplers"))) continue;
+				identifier.setName(samplerName);
+			}
 		}
 
 		for (var tree : trees.values()) {
@@ -396,6 +401,7 @@ public class CompatibilityTransformer {
 		if (vulkan) {
 			for (var tree : trees.values()) {
 				initializeGlobals(parser, tree);
+				initializeLocalScalars(tree);
 			}
 		}
 	}
@@ -540,6 +546,29 @@ public class CompatibilityTransformer {
 
 		if (initialized) {
 			tree.parseAndInjectNode(parser, ASTInjectionPoint.BEFORE_ALL, "#extension GL_EXT_null_initializer : require\n");
+		}
+	}
+
+	// This fixes SEUS PTGI HRR 2.1 and 3, which have a loose `int x;` that's uninitialized on Vulkan and causes corruption.
+	private static void initializeLocalScalars(TranslationUnit tree) {
+		for (var variables : tree.getRoot().nodeIndex.getStream(TypeAndInitDeclaration.class).toList()) {
+			if (variables.getAncestor(FunctionDefinition.class) == null || !(variables.getType()
+				.getTypeSpecifier() instanceof BuiltinNumericTypeSpecifier numeric) || (numeric.type != Type.INT32 && numeric.type != Type.FLOAT32) || numeric.getArraySpecifier() != null) {
+				continue;
+			}
+
+			var qualifier = variables.getType().getTypeQualifier();
+
+			if (qualifier != null && qualifier.getParts().stream().anyMatch(StorageQualifier.class::isInstance)) {
+				continue;
+			}
+
+			for (var member : variables.getMembers()) {
+				if (member.getInitializer() == null && member.getArraySpecifier() == null && !member.getName().getName().startsWith("gl_")) {
+					member.setInitializer(tree.getRoot().indexNodes(
+						() -> new ExpressionInitializer(LiteralExpression.getDefaultValue(numeric.type))));
+				}
+			}
 		}
 	}
 

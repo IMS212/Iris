@@ -41,7 +41,7 @@ public class IrisDhRenderDefinition extends AbstractDhApiRenderDefinition {
 		public void runRenderPassSetup(DhApiRenderParam params) {
 			var compat = DHCompatInternal.current();
 			if (compat != null) {
-				compat.setup(params);
+				compat.setup();
 			}
 		}
 

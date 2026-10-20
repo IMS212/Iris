@@ -4,6 +4,7 @@ import com.mojang.blaze3d.systems.RenderSystem;
 import com.mojang.renderpearl.api.GpuFormat;
 import com.mojang.renderpearl.api.textures.GpuTexture;
 import com.mojang.renderpearl.api.textures.GpuTextureView;
+import net.irisshaders.iris.backend.RenderGraph;
 import net.irisshaders.iris.gl.framebuffer.ViewportData;
 import net.irisshaders.iris.gl.sampler.GlSampler;
 import net.irisshaders.iris.gl.sampler.SamplerHolder.TextureBinding;
@@ -22,7 +23,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.function.Supplier;
 
-public final class CenterDepthSampler {
+public class CenterDepthSampler {
 	private final Supplier<GpuTexture> depthSupplier;
 	private final GpuTexture texture;
 	private final GpuTexture history;
@@ -37,7 +38,7 @@ public final class CenterDepthSampler {
 	private boolean destroyed;
 	private int samples;
 
-	public CenterDepthSampler(Supplier<GpuTexture> depthSupplier, float halfLife) {
+	public CenterDepthSampler(PackSamplers samplers, Supplier<GpuTexture> depthSupplier, float halfLife) {
 		if (!Float.isFinite(halfLife) || halfLife < 0) {
 			throw new IllegalArgumentException("invalid center-depth half-life");
 		}
@@ -55,9 +56,10 @@ public final class CenterDepthSampler {
 			cleanup.add(this.outputView::close);
 			this.historyView = RenderSystem.getDevice().createTextureView(this.history);
 			cleanup.add(this.historyView::close);
+			this.depthView = RenderSystem.getDevice().createTextureView(this.depthSupplier.get(), 0, 1);
+			cleanup.add(this.depthView::close);
 			RenderSystem.getDevice().createCommandEncoder().clearColorTexture(this.history, new Vector4f());
-			this.samplers = new PackSamplers();
-			cleanup.add(this.samplers::close);
+			this.samplers = samplers;
 			var outputs = new ColorAttachmentPlan.Builder().program("centerDepth", new int[]{0}, Set.of()).build(1).program("centerDepth");
 			this.program = new CompositeProgram(this.samplers, "centerDepth", Map.of(PatchShaderType.VERTEX,
 				"#version 330\nlayout(location=0) in vec3 Position; void main(){gl_Position=vec4(Position.xy*2.0-1.0,0,1);}",
@@ -99,6 +101,15 @@ public final class CenterDepthSampler {
 		}
 	}
 
+	private Runnable beforeCopy = () -> { };
+
+	public void buildGraph(RenderGraph graph) {
+		graph.graphics(this.program, List.of(
+			new RenderGraph.Access(RenderGraph.image(this.depthSupplier.get()), RenderGraph.Stage.FRAGMENT.bit, RenderGraph.Usage.SHADER.bit, 0),
+			new RenderGraph.Access(RenderGraph.image(this.history), RenderGraph.Stage.FRAGMENT.bit, RenderGraph.Usage.SHADER.bit, 0)), List.of(this.outputView));
+		this.beforeCopy = graph.copy(this.texture, this.history);
+	}
+
 	public void sampleCenterDepth() {
 		this.sampleCenterDepth(SystemTimeUniforms.TIMER.getLastFrameTime());
 	}
@@ -128,6 +139,7 @@ public final class CenterDepthSampler {
 		this.samplers.beginFrame();
 		this.program.draw(List.of(this.outputView), ViewportData.defaultValue(), this.samples, this.samples);
 		this.samples++;
+		this.beforeCopy.run();
 		RenderSystem.getDevice().createCommandEncoder().copyTextureToTexture(this.texture, this.history, 0, 0, 0, 0, 0, 1, 1);
 		this.hasFirstSample = true;
 	}
@@ -151,7 +163,6 @@ public final class CenterDepthSampler {
 
 		destroyed = true;
 		this.program.destroy();
-		this.samplers.close();
 
 		if (this.depthView != null) {
 			this.depthView.close();

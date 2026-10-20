@@ -3,6 +3,7 @@ package net.irisshaders.iris.pathways.colorspace;
 import com.mojang.blaze3d.systems.RenderSystem;
 import com.mojang.renderpearl.api.textures.GpuTexture;
 import com.mojang.renderpearl.api.textures.GpuTextureView;
+import net.irisshaders.iris.backend.RenderGraph;
 import net.irisshaders.iris.gl.framebuffer.ViewportData;
 import net.irisshaders.iris.gl.sampler.GlSampler;
 import net.irisshaders.iris.gl.sampler.SamplerHolder.TextureBinding;
@@ -11,6 +12,7 @@ import net.irisshaders.iris.helpers.StringPair;
 import net.irisshaders.iris.pipeline.programs.CompositeProgram;
 import net.irisshaders.iris.pipeline.transform.PatchShaderType;
 import net.irisshaders.iris.samplers.PackSamplers;
+import net.irisshaders.iris.samplers.SamplerHeapLayout;
 import net.irisshaders.iris.shaderpack.preprocessor.JcppProcessor;
 import net.irisshaders.iris.targets.ColorAttachmentPlan;
 import org.joml.Matrix4f;
@@ -27,11 +29,14 @@ import java.util.Set;
 public class ColorSpaceFragmentConverter implements ColorSpaceConverter {
 	private ColorSpace colorSpace;
 	private CompositeProgram program;
-	private PackSamplers samplers;
+	private final PackSamplers samplers;
 	private GpuTexture swap;
 	private GpuTextureView swapView, target;
 
-	public ColorSpaceFragmentConverter(int width, int height, ColorSpace colorSpace) {
+	public ColorSpaceFragmentConverter(PackSamplers samplers, int width, int height, ColorSpace colorSpace) {
+		this.samplers = samplers;
+		// Reserve this draw binding even when starting in sRGB, so switching color spaces does not change the pack layout.
+		samplers.register(SamplerHeapLayout.Type.SAMPLER2D, "colorSpace/input", true);
 		rebuildProgram(width, height, colorSpace);
 	}
 
@@ -63,7 +68,6 @@ public class ColorSpaceFragmentConverter implements ColorSpaceConverter {
 		}
 
 		fragment = JcppProcessor.glslPreprocessSource(fragment, defines);
-		this.samplers = new PackSamplers();
 
 		var outputs = new ColorAttachmentPlan.Builder().program("colorSpace", new int[]{0}, Set.of()).build(1).program("colorSpace");
 		this.program = new CompositeProgram(this.samplers, "colorSpace",
@@ -71,44 +75,52 @@ public class ColorSpaceFragmentConverter implements ColorSpaceConverter {
 		this.program.getUniforms()
 			.uniformMatrix(UniformUpdateFrequency.ONCE, "projection", () -> new Matrix4f(2, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, -1, -1, 0, 1));
 		this.program.getSamplers()
-			.addTextureSampler(new TextureBinding("colorSpace/input", () -> this.target, () -> GlSampler.NEAREST), false, "readImage");
+			.addDrawTextureSampler(new TextureBinding("colorSpace/input", () -> this.target, () -> GlSampler.NEAREST), false, "readImage");
 		this.program.getSamplers().finish();
 	}
 
+	private Runnable beforeCopy = () -> { };
+	private Runnable after = () -> { };
+
 	@Override
 	public void prepare(GpuTextureView target) {
-		if (this.program != null) {
-			this.program.prepare(List.of(target));
+		if (this.program == null) return;
+		var device = RenderSystem.getDevice();
+		int width = target.getWidth(0), height = target.getHeight(0);
+		if (this.swap == null || this.swap.getWidth(0) != width || this.swap.getHeight(0) != height
+			|| this.swap.getFormat() != target.texture().getFormat()) {
+			if (this.swap != null) {
+				this.swapView.close();
+				this.swap.close();
+			}
+			this.swap = device.createTexture("Iris color conversion", GpuTexture.USAGE_RENDER_ATTACHMENT | GpuTexture.USAGE_COPY_SRC,
+				target.texture().getFormat(), width, height, 1, 1);
+			this.swapView = device.createTextureView(this.swap);
+		}
+		this.target = target;
+		try {
+			this.program.prepare(List.of(this.swapView));
+			var graph = new RenderGraph(this.samplers);
+			graph.graphics(this.program, List.of(this.swapView));
+			this.beforeCopy = graph.copy(this.swap, target.texture());
+			this.after = graph.external();
+		} finally {
+			this.target = null;
 		}
 	}
 
 	@Override
 	public void process(GpuTextureView target) {
-		if (this.colorSpace == ColorSpace.SRGB) {
-			return;
-		}
-
-		var device = RenderSystem.getDevice();
-		int width = target.getWidth(0);
-		int height = target.getHeight(0);
-
-		if (this.swap == null || this.swap.getWidth(0) != width || this.swap.getHeight(
-			0) != height || this.swap.getFormat() != target.texture().getFormat()) {
-			if (this.swap != null) {
-				this.swapView.close();
-				this.swap.close();
-			}
-
-			this.swap = device.createTexture("Iris color conversion", GpuTexture.USAGE_RENDER_ATTACHMENT | GpuTexture.USAGE_COPY_SRC,
-				target.texture().getFormat(), width, height, 1, 1);
-			this.swapView = device.createTextureView(this.swap);
-		}
-
+		if (this.colorSpace == ColorSpace.SRGB) return;
+		if (this.swap == null || this.swap.getWidth(0) != target.getWidth(0) || this.swap.getHeight(0) != target.getHeight(0)
+			|| this.swap.getFormat() != target.texture().getFormat()) this.prepare(target);
 		this.target = target;
-
 		try {
 			this.program.draw(List.of(this.swapView), new ViewportData(1, 0, 0), 0, 0);
-			device.createCommandEncoder().copyTextureToTexture(this.swap, target.texture(), 0, 0, 0, 0, 0, width, height);
+			this.beforeCopy.run();
+			RenderSystem.getDevice().createCommandEncoder().copyTextureToTexture(this.swap, target.texture(), 0, 0, 0, 0, 0,
+				target.getWidth(0), target.getHeight(0));
+			this.after.run();
 		} finally {
 			this.target = null;
 		}
@@ -119,11 +131,6 @@ public class ColorSpaceFragmentConverter implements ColorSpaceConverter {
 		if (this.program != null) {
 			this.program.destroy();
 			this.program = null;
-		}
-
-		if (this.samplers != null) {
-			this.samplers.close();
-			this.samplers = null;
 		}
 
 		if (this.swap != null) {

@@ -12,13 +12,9 @@ import com.seibel.distanthorizons.api.methods.events.sharedParameterObjects.DhAp
 import com.seibel.distanthorizons.api.methods.events.sharedParameterObjects.DhApiEventParam;
 import com.seibel.distanthorizons.api.methods.events.sharedParameterObjects.DhApiRenderParam;
 import com.seibel.distanthorizons.api.objects.DhApiResult;
-import com.seibel.distanthorizons.core.api.internal.ClientApi;
-import com.seibel.distanthorizons.core.util.math.DhMat4f;
-import com.seibel.distanthorizons.coreapi.DependencyInjection.OverrideInjector;
 import net.irisshaders.iris.Iris;
 import net.irisshaders.iris.shadows.ShadowRenderer;
 import net.irisshaders.iris.shadows.ShadowRenderingState;
-import net.irisshaders.iris.uniforms.CapturedRenderingState;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -27,7 +23,6 @@ import java.util.concurrent.CompletableFuture;
 public class LodRendererEvents {
 	private static IrisDhRenderDefinition definition;
 	private static CompletableFuture<DhApiResult<String>> switchFuture;
-	private static boolean renderingLods;
 	private static boolean requested;
 	private static boolean applied;
 	private static boolean previousDeferred;
@@ -60,7 +55,7 @@ public class LodRendererEvents {
 				clearShadowFrustum();
 				if (event.value.renderDefinition == definition && ShadowRenderingState.areShadowsCurrentlyBeingRendered()) {
 					shadowFrustum = (IDhApiOverrideable) ShadowRenderer.FRUSTUM;
-					OverrideInjector.INSTANCE.bind(IDhApiShadowCullingFrustum.class, shadowFrustum);
+					DhApi.overrides.bind(IDhApiShadowCullingFrustum.class, shadowFrustum);
 				}
 			}
 		});
@@ -118,37 +113,11 @@ public class LodRendererEvents {
 		}
 	}
 
-	public static boolean isRenderingLods() {
-		return renderingLods;
-	}
-
-	public static void renderLods(boolean translucent) {
-		updateRenderer();
-		var compat = DHCompatInternal.current();
-		if (compat == null || compat.incompatiblePack() || !DHCompatInternal.hasRenderingEnabled() || ShadowRenderingState.areShadowsCurrentlyBeingRendered() && !compat.hasShadowShader()) {
-			return;
-		}
-		var state = ClientApi.RENDER_STATE;
-		var oldModelView = state.mcModelViewMatrix;
-		state.mcModelViewMatrix = new DhMat4f(
-			ShadowRenderingState.areShadowsCurrentlyBeingRendered() ? ShadowRenderer.MODELVIEW : CapturedRenderingState.INSTANCE.getGbufferModelView());
-		renderingLods = true;
-		try {
-			DhApi.Delayed.renderProxy.setDeferTransparentRendering(true);
-			if (translucent) {
-				ClientApi.INSTANCE.renderDeferredLodsForShaders();
-			} else {
-				ClientApi.INSTANCE.renderLods();
-			}
-		} finally {
-			renderingLods = false;
-			state.mcModelViewMatrix = oldModelView;
-		}
-	}
-
 	private static void cancelUnsupportedPass(DhApiCancelableEventParam<DhApiRenderParam> event) {
 		var compat = DHCompatInternal.current();
-		if (ShadowRenderingState.areShadowsCurrentlyBeingRendered() && (compat == null || !compat.hasShadowShader() || event.value.renderDefinition != definition)) {
+		if (Iris.isPackInUseQuick() && (compat == null || compat.incompatiblePack())) {
+			event.cancelEvent();
+		} else if (ShadowRenderingState.areShadowsCurrentlyBeingRendered() && (compat == null || !compat.hasShadowShader() || event.value.renderDefinition != definition)) {
 			event.cancelEvent();
 		} else if ((event.value.renderDefinition == definition && (compat == null || compat.incompatiblePack())) || (compat != null && !compat.incompatiblePack() && event.value.renderDefinition != definition)) {
 			event.cancelEvent();
@@ -157,7 +126,7 @@ public class LodRendererEvents {
 
 	private static void clearShadowFrustum() {
 		if (shadowFrustum != null) {
-			OverrideInjector.INSTANCE.unbind(IDhApiShadowCullingFrustum.class, shadowFrustum);
+			DhApi.overrides.unbind(IDhApiShadowCullingFrustum.class, shadowFrustum);
 			shadowFrustum = null;
 		}
 	}

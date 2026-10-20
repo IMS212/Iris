@@ -9,13 +9,10 @@ import com.mojang.renderpearl.backend.api.RenderPassBackend;
 import java.util.List;
 
 public interface WorldPassCommands extends RenderPassBackend, IrisRenderPass {
-	default void end() {
+	public default void end() {
 	}
 
-	default void allowReuse() {
-	}
+	public long getTexelBufferView(GpuBufferSlice slice, GpuFormat format);
 
-	long getTexelBufferView(GpuBufferSlice slice, GpuFormat format);
-
-	void setAttachments(List<GpuTextureView> colors, GpuTextureView depth, RenderArea area);
+	public void setAttachments(List<GpuTextureView> colors, GpuTextureView depth, RenderArea area);
 }

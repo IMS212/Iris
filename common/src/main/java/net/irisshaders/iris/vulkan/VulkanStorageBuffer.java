@@ -6,6 +6,7 @@ import com.mojang.renderpearl.backend.vulkan.VulkanCommandEncoder;
 import com.mojang.renderpearl.backend.vulkan.VulkanDevice;
 import com.mojang.renderpearl.backend.vulkan.VulkanGpuBuffer;
 import org.lwjgl.system.MemoryStack;
+import org.lwjgl.system.MemoryUtil;
 import org.lwjgl.util.vma.Vma;
 import org.lwjgl.util.vma.VmaAllocationCreateInfo;
 import org.lwjgl.vulkan.VK10;
@@ -13,9 +14,8 @@ import org.lwjgl.vulkan.VkBufferCopy;
 import org.lwjgl.vulkan.VkBufferCreateInfo;
 import org.lwjgl.vulkan.VkPhysicalDeviceProperties;
 
-import java.nio.ByteBuffer;
-
 import static net.irisshaders.iris.gl.buffer.ShaderStorageBuffer.USAGE_STORAGE;
+import static net.irisshaders.iris.vulkan.VulkanChecks.check;
 
 public class VulkanStorageBuffer extends VulkanGpuBuffer {
 	private final VulkanDevice device;
@@ -26,20 +26,23 @@ public class VulkanStorageBuffer extends VulkanGpuBuffer {
 		this(device, allocate(device, name, size, content), size);
 
 		try (var stack = MemoryStack.stackPush()) {
-			var encoder = device.createCommandEncoder();
-			var command = VulkanCommandBridge.commandBuffer(encoder);
+			var command = VulkanCommandBridge.commandBuffer();
 			VulkanCommandEncoder.memoryBarrier(command, stack);
 			VK10.vkCmdFillBuffer(command, this.vkBuffer(), 0, VK10.VK_WHOLE_SIZE, 0);
 			VulkanCommandEncoder.memoryBarrier(command, stack);
 
 			if (content != null && content.length > 0) {
-				var data = ByteBuffer.allocateDirect(Math.toIntExact(alignedSize(content.length)));
-				data.put(content).position(0);
-
-				try (var staging = device.createBuffer(() -> name + " upload", GpuBuffer.USAGE_COPY_SRC, data)) {
-					var copy = VkBufferCopy.calloc(1, stack).size(data.remaining());
-					VK10.vkCmdCopyBuffer(command, ((VulkanGpuBuffer) staging).vkBuffer(), this.vkBuffer(), copy);
-					VulkanCommandEncoder.memoryBarrier(command, stack);
+				var data = MemoryUtil.memAlloc(Math.toIntExact(alignedSize(content.length)));
+				try {
+					MemoryUtil.memSet(data, 0);
+					data.put(content).position(0);
+					try (var staging = device.createBuffer(() -> name + " upload", GpuBuffer.USAGE_COPY_SRC, data)) {
+						var copy = VkBufferCopy.calloc(1, stack).size(data.remaining());
+						VK10.vkCmdCopyBuffer(command, ((VulkanGpuBuffer) staging).vkBuffer(), this.vkBuffer(), copy);
+						VulkanCommandEncoder.memoryBarrier(command, stack);
+					}
+				} finally {
+					MemoryUtil.memFree(data);
 				}
 			}
 		} catch (RuntimeException | Error failure) {
@@ -84,12 +87,6 @@ public class VulkanStorageBuffer extends VulkanGpuBuffer {
 			device.instance().debug().setObjectName(device.vkDevice(), VK10.VK_OBJECT_TYPE_BUFFER, buffer.get(0), name);
 
 			return new Allocation(buffer.get(0), memory.get(0));
-		}
-	}
-
-	private static void check(int result, String action) {
-		if (result != VK10.VK_SUCCESS) {
-			throw new IllegalStateException("failed to " + action + ": " + result);
 		}
 	}
 

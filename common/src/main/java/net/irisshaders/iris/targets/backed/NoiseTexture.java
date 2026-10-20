@@ -9,6 +9,7 @@ import org.lwjgl.opengl.GL11C;
 import org.lwjgl.opengl.GL13C;
 import org.lwjgl.opengl.GL20C;
 import org.lwjgl.opengl.GL43C;
+import org.lwjgl.system.MemoryUtil;
 
 import java.nio.ByteBuffer;
 import java.util.Random;
@@ -47,14 +48,18 @@ public class NoiseTexture extends GlResource {
 
 		ByteBuffer pixels = generateNoise();
 
-		TextureUploadHelper.resetTextureUploadState();
+		try {
+			TextureUploadHelper.resetTextureUploadState();
 
-		// Since we're using tightly-packed RGB data, we must use an alignment of 1 byte instead of the usual 4 bytes.
-		GlStateManager._pixelStore(GL20C.GL_UNPACK_ALIGNMENT, 1);
-		IrisRenderSystem.texImage2D(texture, GL11C.GL_TEXTURE_2D, 0, GL11C.GL_RGB8, width, height, 0, GL11C.GL_RGB, GL11C.GL_UNSIGNED_BYTE,
-			pixels);
+			// Since we're using tightly-packed RGB data, we must use an alignment of 1 byte instead of the usual 4 bytes.
+			GlStateManager._pixelStore(GL20C.GL_UNPACK_ALIGNMENT, 1);
+			IrisRenderSystem.texImage2D(texture, GL11C.GL_TEXTURE_2D, 0, GL11C.GL_RGB8, width, height, 0, GL11C.GL_RGB, GL11C.GL_UNSIGNED_BYTE,
+				pixels);
 
-		GlStateManager._bindTexture(0);
+			GlStateManager._bindTexture(0);
+		} finally {
+			MemoryUtil.memFree(pixels);
+		}
 	}
 
 	private ByteBuffer generateNoise() {
@@ -63,11 +68,7 @@ public class NoiseTexture extends GlResource {
 		Random random = new Random(0);
 		random.nextBytes(pixels);
 
-		ByteBuffer buffer = ByteBuffer.allocateDirect(pixels.length);
-		buffer.put(pixels);
-		buffer.flip();
-
-		return buffer;
+		return MemoryUtil.memAlloc(pixels.length).put(pixels).flip();
 	}
 
 	public int getTextureId() {
